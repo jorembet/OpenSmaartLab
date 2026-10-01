@@ -751,12 +751,62 @@ int main()
         require (perOctave < -2.0 && perOctave > -4.0,
                  "Pink noise must keep its -3 dB per octave tilt across the band");
 
-        // The band limits must be adjustable and the noise must follow.
+        // Both ends of the band must be adjustable from the UI, since the frequency
+        // control only drives the upper limit for pink noise.
         generator.setBandLimits (100.0f, 10000.0f);
         require (std::abs (generator.getBandLow() - 100.0f) < 0.01f
                  && std::abs (generator.getBandHigh() - 10000.0f) < 0.01f,
                  "Band limits must be adjustable");
 
+        // And the noise must actually move with them, not just report new numbers.
+        generator.setRunning (true);
+        std::vector<float> narrowed ((size_t) size * 4);
+
+        for (int block = 0; block < 4; ++block)
+            generator.process (narrowed.data() + (size_t) block * size, size);
+
+        dsp::Spectrum narrowedSpectrum;
+        analyser.analyse (narrowed.data(), narrowedSpectrum);
+
+        auto inBand = [&narrowedSpectrum] (double low, double high, double& power)
+        {
+            power = 0.0;
+
+            for (size_t i = 0; i < narrowedSpectrum.freq.size(); ++i)
+                if (narrowedSpectrum.freq[i] >= low && narrowedSpectrum.freq[i] < high)
+                    power += std::pow (10.0, narrowedSpectrum.magnitudeDb[i] / 10.0);
+        };
+
+        double lowBand = 0.0, highBand = 0.0;
+        inBand (20.0, 100.0, lowBand);
+        inBand (5000.0, 10000.0, highBand);
+
+        // Power sums read high because pink noise puts most of its energy in the low
+        // octaves, so the removed band is checked against its own mid-band level.
+        auto octaveRmsIn = [&narrowedSpectrum] (float low, float high)
+        {
+            double power = 0.0;
+            auto bins = 0;
+
+            for (size_t i = 0; i < narrowedSpectrum.freq.size(); ++i)
+                if (narrowedSpectrum.freq[i] >= low && narrowedSpectrum.freq[i] < high)
+                {
+                    power += std::pow (10.0, narrowedSpectrum.magnitudeDb[i] / 10.0);
+                    ++bins;
+                }
+
+            return bins > 0 ? dsp::db10 ((float) (power / bins)) : dsp::dbFloor;
+        };
+
+        require (octaveRmsIn (25.0f, 31.5f) < octaveRmsIn (5000.0f, 10000.0f) - 60.0f,
+                 "Raising the pink noise floor to 100 Hz must silence the 25 Hz octave");
+
+        // The band floor must never rise above the ceiling, whatever the order.
+        generator.setBandLimits (5000.0f, 3000.0f);
+        require (generator.getBandLow() <= generator.getBandHigh(),
+                 "A band floor above the ceiling must be refused, not inverted");
+
+        generator.setBandLimits (20.0f, 20000.0f);
         generator.setRunning (false);
     }
 
@@ -862,6 +912,7 @@ int main()
     std::cout << "PASS: RTA RMS/peak figures are 3.01 dB apart on a full-scale sine and hide silence\n";
     std::cout << "PASS: typed generator frequencies are applied exactly and out-of-range values clamp\n";
     std::cout << "PASS: pink noise puts 95%+ of its power inside 20 Hz - 20 kHz and keeps its tilt\n";
+    std::cout << "PASS: both pink noise band limits are adjustable and the signal follows them\n";
     std::cout << "PASS: ISO 266 nominal 1/3 octave table exact; 1/1..1/12 octave counts 11/21/31/41/61/121 strictly increasing\n";
     std::cout << "PASS: bars tile 20 Hz to 20 kHz with no clipping and every centre inside its bar\n";
     std::cout << "PASS: octave bands reject DC offset while keeping the floor level\n";

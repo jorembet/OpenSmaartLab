@@ -158,14 +158,21 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     generatorFrequencySlider.onValueChange = [this]
     {
         const auto value = (float) generatorFrequencySlider.getValue();
-        audioEngine.getGenerator().setFrequency(value);
+        auto& generator = audioEngine.getGenerator();
+
+        // The slider means a tone frequency for sine, and the upper band limit for
+        // pink noise. Following the current type keeps one control useful for both.
+        if (generator.getType() == SignalGenerator::Type::Pink)
+            generator.setBandLimits (generator.getBandLow(), value);
+        else
+            generator.setFrequency (value);
 
         if (! isEditingGeneratorFrequency())
             generatorFrequencyEditor.setText (juce::String (juce::roundToInt (value)),
                                              juce::dontSendNotification);
     };
 
-    generatorSweepStartSlider.setRange(20.0, 2000.0, 1.0);
+    generatorSweepStartSlider.setRange(10.0, 2000.0, 1.0);
     generatorSweepStartSlider.setValue(20.0, juce::dontSendNotification);
     generatorSweepStartSlider.setTextValueSuffix(" Hz");
     generatorSweepStartSlider.onValueChange = [this]
@@ -226,6 +233,9 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     generatorPanel.addAndMakeVisible(generatorLevelSlider);
     generatorPanel.addAndMakeVisible(generatorFrequencySlider);
     generatorPanel.addAndMakeVisible(generatorFrequencyEditor);
+    generatorPanel.addAndMakeVisible(generatorBandLowLabel);
+    generatorPanel.addAndMakeVisible(generatorBandLowSlider);
+    generatorPanel.addAndMakeVisible(generatorBandLowEditor);
     generatorPanel.addAndMakeVisible(generatorSweepStartSlider);
     generatorPanel.addAndMakeVisible(generatorSweepEndSlider);
     generatorPanel.addAndMakeVisible(generatorSweepDurationSlider);
@@ -501,6 +511,25 @@ void MainComponent::playPinkNoise()
         return;
     }
     generatorTypeSelector.setSelectedId(1, juce::sendNotificationSync);
+
+    // A low-band slider for pink noise, so both ends of the band can be set. The
+    // frequency control handles the upper end, so this only covers the lower.
+    generatorBandLowSlider.setRange(10.0, 500.0, 1.0);
+    generatorBandLowSlider.setSkewFactorFromMidPoint (50.0f);
+    generatorBandLowSlider.setValue (audioEngine.getGenerator().getBandLow(),
+                                     juce::dontSendNotification);
+    generatorBandLowSlider.setTextValueSuffix (" Hz");
+    generatorBandLowSlider.onValueChange = [this]
+    {
+        auto& generator = audioEngine.getGenerator();
+        generator.setBandLimits ((float) generatorBandLowSlider.getValue(), generator.getBandHigh());
+        updateGeneratorInfo();
+    };
+    generatorBandLowLabel.setText ("Batas bawah pink noise", juce::dontSendNotification);
+    generatorBandLowEditor.setKeyboardType (juce::TextEditor::numericKeyboard);
+    generatorBandLowEditor.setTooltip ("Batas bawah pink noise dalam Hz");
+    generatorBandLowEditor.setTextToShowWhenEmpty ("Hz", mutedColour);
+    generatorBandLowEditor.addListener (&bandLowEditorListener);
     if (!isRunning)
         startStopClicked();
     if (isRunning)
@@ -1235,22 +1264,87 @@ bool MainComponent::isEditingGeneratorFrequency() const
     return frequencyEditorActive;
 }
 
-void MainComponent::FrequencyEditorListener::textEditorReturnKeyPressed (juce::TextEditor&)
+bool MainComponent::isEditingGeneratorBandLow() const
 {
+    return bandLowEditorActive;
+}
+
+void MainComponent::updateGeneratorBandLowEditor()
+{
+    if (isEditingGeneratorBandLow())
+        return;
+
+    const auto value = audioEngine.getGenerator().getBandLow();
+    generatorBandLowEditor.setText (juce::String (value, std::fmod (value, 1.0f) > 0.05f ? 1 : 0),
+                                    juce::dontSendNotification);
+}
+
+void MainComponent::FrequencyEditorListener::textEditorEscapeKeyPressed (juce::TextEditor& editor)
+{
+    component.frequencyEditorActive = false;
+    component.updateGeneratorFrequencyEditor();
+
+    if (&editor == &component.generatorBandLowEditor)
+    {
+        component.bandLowEditorActive = false;
+        component.updateGeneratorBandLowEditor();
+    }
+}
+
+void MainComponent::applyTypedBandLow()
+{
+    const auto typed = generatorBandLowEditor.getText().trim();
+
+    if (typed.isEmpty())
+    {
+        updateGeneratorBandLowEditor();
+        return;
+    }
+
+    const auto parsed = typed.getFloatValue();
+
+    if (parsed < 10.0f)
+    {
+        statusLabel.setText ("Batas bawah minimal 10 Hz", juce::dontSendNotification);
+        updateGeneratorBandLowEditor();
+        return;
+    }
+
+    auto& generator = audioEngine.getGenerator();
+    const auto clamped = juce::jmin (parsed, 2000.0f);
+
+    generator.setBandLimits (clamped, generator.getBandHigh());
+    generatorBandLowSlider.setValue ((double) generator.getBandLow(), juce::dontSendNotification);
+    updateGeneratorBandLowEditor();
+    updateGeneratorInfo();
+
+    statusLabel.setText ("Pink noise: " + juce::String (generator.getBandLow(), 1)
+                         + " Hz - " + juce::String (generator.getBandHigh(), 1) + " Hz",
+                         juce::dontSendNotification);
+}
+
+void MainComponent::FrequencyEditorListener::textEditorReturnKeyPressed (juce::TextEditor& editor)
+{
+    if (&editor == &component.generatorBandLowEditor)
+    {
+        component.bandLowEditorActive = false;
+        component.applyTypedBandLow();
+        return;
+    }
+
     component.frequencyEditorActive = false;
     component.applyTypedFrequency();
 }
 
-void MainComponent::FrequencyEditorListener::textEditorEscapeKeyPressed (juce::TextEditor&)
+void MainComponent::FrequencyEditorListener::textEditorFocusLost (juce::TextEditor& editor)
 {
-    // Escape abandons the edit and restores the slider's value, which is what someone
-    // who types a number and then changes their mind expects.
-    component.frequencyEditorActive = false;
-    component.updateGeneratorFrequencyEditor();
-}
+    if (&editor == &component.generatorBandLowEditor)
+    {
+        component.bandLowEditorActive = false;
+        component.updateGeneratorBandLowEditor();
+        return;
+    }
 
-void MainComponent::FrequencyEditorListener::textEditorFocusLost (juce::TextEditor&)
-{
     component.frequencyEditorActive = false;
     component.applyTypedFrequency();
 }
@@ -1266,24 +1360,40 @@ void MainComponent::applyTypedFrequency()
     }
 
     const auto parsed = typed.getFloatValue();
+    auto& generator = audioEngine.getGenerator();
+    const auto pink = generator.getType() == SignalGenerator::Type::Pink;
 
-    if (parsed < 1.0f)
+    // Pink noise is limited to a band, so the accepted range is narrower than a single
+    // tone and the low end cannot go below the existing band floor.
+    const auto low = pink ? 100.0f : 1.0f;
+    const auto high = 20000.0f;
+
+    if (parsed < low)
     {
-        statusLabel.setText ("Frekuensi harus antara 1 Hz dan 20000 Hz", juce::dontSendNotification);
+        statusLabel.setText ("Frekuensi minimal " + juce::String ((int) low) + " Hz",
+                             juce::dontSendNotification);
         updateGeneratorFrequencyEditor();
         return;
     }
 
-    const auto clamped = juce::jlimit(1.0f, 20000.0f, parsed);
+    const auto clamped = juce::jlimit (low, high, parsed);
 
-    generatorFrequencySlider.setValue ((double) clamped, juce::sendNotificationSync);
-    audioEngine.getGenerator().setFrequency (clamped);
+    if (pink)
+        generator.setBandLimits (generator.getBandLow(), clamped);
+    else
+        generator.setFrequency (clamped);
+
+    generatorFrequencySlider.setValue ((double) clamped, juce::dontSendNotification);
     updateGeneratorFrequencyEditor();
 
     if (std::abs (clamped - parsed) > 0.05f)
-        statusLabel.setText ("Frekuensi dibatasi ke 20000 Hz", juce::dontSendNotification);
+        statusLabel.setText ("Nilai dibatasi ke " + juce::String ((int) high) + " Hz",
+                             juce::dontSendNotification);
     else
-        statusLabel.setText ("Frekuensi generator: " + juce::String (parsed, 1) + " Hz",
+        statusLabel.setText (pink ? "Pink noise dibatasi sampai "
+                                    + juce::String (parsed, 1) + " Hz (bawah "
+                                    + juce::String (generator.getBandLow(), 1) + " Hz)"
+                                  : "Frekuensi generator: " + juce::String (parsed, 1) + " Hz",
                              juce::dontSendNotification);
 }
 
@@ -1303,15 +1413,32 @@ void MainComponent::updateGeneratorFrequencyEditor()
 void MainComponent::updateGeneratorGeneratorControls()
 {
     const auto type = audioEngine.getGenerator().getType();
-    const auto manualFrequency = type == SignalGenerator::Type::Sine;
+    const auto& generator = audioEngine.getGenerator();
+    const auto sine = type == SignalGenerator::Type::Sine;
+    const auto pink = type == SignalGenerator::Type::Pink;
     const auto sweep = type == SignalGenerator::Type::LogSweep;
 
-    // Controls that do nothing for the current type are dimmed rather than removed,
-    // so the layout does not jump when switching between them.
-    generatorFrequencyLabel.setEnabled (manualFrequency);
-    generatorFrequencySlider.setEnabled (manualFrequency);
-    generatorFrequencyEditor.setEnabled (manualFrequency);
-    generatorFrequencyEditor.setAlpha (manualFrequency ? 1.0f : 0.4f);
+    // The same frequency control means different things per signal type: a single
+    // tone for sine, the upper band limit for pink noise. The label follows so the
+    // meaning is never ambiguous, and only the truly irrelevant controls are dimmed.
+    if (sine)
+        generatorFrequencyLabel.setText ("Frekuensi", juce::dontSendNotification);
+    else if (pink)
+        generatorFrequencyLabel.setText ("Batas atas pink noise",
+                                         juce::dontSendNotification);
+    else
+        generatorFrequencyLabel.setText ("Frekuensi",
+                                         juce::dontSendNotification);
+
+    const auto live = sine || pink;
+    generatorFrequencyLabel.setEnabled (live);
+    generatorBandLowLabel.setEnabled (pink);
+    generatorBandLowSlider.setEnabled (pink);
+    generatorBandLowEditor.setEnabled (pink);
+    generatorBandLowEditor.setAlpha (pink ? 1.0f : 0.4f);
+    generatorFrequencySlider.setEnabled (live);
+    generatorFrequencyEditor.setEnabled (live);
+    generatorFrequencyEditor.setAlpha (live ? 1.0f : 0.4f);
 
     for (auto* label : { &generatorSweepStartLabel, &generatorSweepEndLabel,
                          &generatorSweepDurationLabel })
@@ -1320,6 +1447,16 @@ void MainComponent::updateGeneratorGeneratorControls()
     generatorSweepStartSlider.setEnabled (sweep);
     generatorSweepEndSlider.setEnabled (sweep);
     generatorSweepDurationSlider.setEnabled (sweep);
+
+    // Point the control at whatever it currently means for this type.
+    if (pink)
+    {
+        generatorFrequencySlider.setValue ((double) generator.getBandHigh(),
+                                          juce::dontSendNotification);
+        generatorBandLowSlider.setValue ((double) generator.getBandLow(),
+                                         juce::dontSendNotification);
+        updateGeneratorBandLowEditor();
+    }
 
     updateGeneratorFrequencyEditor();
 }
@@ -1352,6 +1489,13 @@ void MainComponent::layoutGenerator()
     generatorFrequencyEditor.setBounds(frequencyRow.removeFromLeft(70).reduced(0, 2));
     frequencyRow.removeFromLeft(6);
     generatorFrequencySlider.setBounds(frequencyRow);
+    column.removeFromTop(12);
+
+    generatorBandLowLabel.setBounds(column.removeFromTop(24));
+    auto bandLowRow = column.removeFromTop(36).reduced(0, 4);
+    generatorBandLowEditor.setBounds(bandLowRow.removeFromLeft(70).reduced(0, 2));
+    bandLowRow.removeFromLeft(6);
+    generatorBandLowSlider.setBounds(bandLowRow);
 
     auto sweepColumn = panel;
 
