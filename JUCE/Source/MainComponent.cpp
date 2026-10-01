@@ -654,6 +654,15 @@ void MainComponent::timerCallback()
     const auto referenceLevel = dsp::db10((float) (referenceEnergy / std::max<size_t>(1, ref.size())));
     const auto measuredLevel = dsp::db10((float) (measuredEnergy / std::max<size_t>(1, meas.size())));
 
+    // Peak is sampled separately from the running total: RMS squares and averages, so
+    // a single loud transient would be invisible in it.
+    auto measuredPeak = 0.0f;
+
+    for (const auto sample : meas)
+        measuredPeak = std::max (measuredPeak, std::abs (sample));
+
+    fftDisplay.setMeasuredLevels (measuredLevel, dsp::db20 (measuredPeak));
+
     splMeter.process(ref.data(), meas.data(), (int) ref.size());
 
     auto result = transferFunction.process(ref.data(), meas.data(), (int) ref.size());

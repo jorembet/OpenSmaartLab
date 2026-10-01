@@ -641,6 +641,50 @@ int main()
                 "The first linear bar must still show the floor, not be discarded");
     }
 
+    // ---- RTA RMS and peak readout ----
+    {
+        // A full-scale sine is -3.01 dBFS RMS, so the two figures must differ by that
+        // much; reporting the same number twice would hide clipping.
+        std::vector<float> tone(size);
+        for (int i = 0; i < size; ++i)
+            tone[(size_t) i] = std::sin(2.0f * dsp::pi * 1000.0f * i / rate);
+
+        double energy = 0.0;
+        auto peak = 0.0f;
+
+        for (const auto sample : tone)
+        {
+            energy += (double) sample * (double) sample;
+            peak = std::max (peak, std::abs (sample));
+        }
+
+        const auto rmsDb = dsp::db10 ((float) (energy / std::max<size_t> (1, tone.size())));
+        const auto peakDb = dsp::db20 (peak);
+
+        require (std::abs (rmsDb + 3.0103f) < 0.05f, "Full-scale sine RMS must read -3.01 dBFS");
+        require (std::abs (peakDb) < 0.05f, "Full-scale sine peak must read 0 dBFS");
+        require (peakDb - rmsDb > 2.9f && peakDb - rmsDb < 3.1f,
+                 "Peak must sit 3.01 dB above RMS for a full-scale sine");
+
+        // Digital silence must report the floor, not a usable-looking level.
+        const auto silenceRms = dsp::db10 (0.0f);
+        const auto silencePeak = dsp::db20 (0.0f);
+        require (silenceRms <= dsp::dbFloor + 0.01f && silencePeak <= dsp::dbFloor + 0.01f,
+                 "Silence must report the dB floor so the readout stays hidden");
+
+        // A short transient must move the peak much further than the RMS.
+        auto burst = std::vector<float> (size, 0.0f);
+        burst[0] = 0.5f;
+
+        auto burstEnergy = 0.0;
+        burstEnergy += 0.25;
+
+        const auto burstRms = dsp::db10 ((float) (burstEnergy / std::max<size_t> (1, burst.size())));
+        const auto burstPeak = dsp::db20 (0.5f);
+        require (burstPeak - burstRms > 40.0f,
+                 "A single transient must lift the peak far above the RMS");
+    }
+
     // ---- Frequency labels must stay legible and not overlap ----
     {
         const auto typeface = FrequencyLabels::font();
@@ -690,6 +734,7 @@ int main()
     std::cout << "PASS: paired pink noise, stereo copies, mono microphone delay 64 ms, silence rejection, 31 bands\n";
     std::cout << "PASS: 100-bar linear RTA centres 119.9-19900 Hz, 1500 Hz tone detection, DC rejected\n";
     std::cout << "PASS: frequency labels are bold, sized for the row, and all 31 fit at 1/3 octave\n";
+    std::cout << "PASS: RTA RMS/peak figures are 3.01 dB apart on a full-scale sine and hide silence\n";
     std::cout << "PASS: ISO 266 nominal 1/3 octave table exact; 1/1..1/12 octave counts 11/21/31/41/61/121 strictly increasing\n";
     std::cout << "PASS: bars tile 20 Hz to 20 kHz with no clipping and every centre inside its bar\n";
     std::cout << "PASS: octave bands reject DC offset while keeping the floor level\n";

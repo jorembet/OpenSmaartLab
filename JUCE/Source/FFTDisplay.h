@@ -73,6 +73,11 @@ public:
     void setDelayAvailable(bool available) { delayAvailable = available; }
     void setDelayMs(float newDelayMs) { delayMs = newDelayMs; }
     void setAverageCoherence(float value) { averageCoherence = value; }
+
+    /** Overall RMS and peak of the measurement channel, in dBFS. */
+    void setMeasuredLevels(float rmsDb, float peakDb);
+    float getMeasuredRmsDb() const { return measuredRmsDb; }
+    float getMeasuredPeakDb() const { return measuredPeakDb; }
     void setRunning(bool isNowRunning);
 
     float getTopDb() const { return topDb; }
@@ -191,8 +196,11 @@ private:
     bool running = false;
     bool delayAvailable = false;
     bool generatorReference = false;
+    bool levelsValid = false;
     float delayMs = 0.0f;
     float averageCoherence = 0.0f;
+    float measuredRmsDb = dsp::dbFloor;
+    float measuredPeakDb = dsp::dbFloor;
 
     MicrophoneCalibration calibration;
     float barCalibrationFactor = 0.0f;
