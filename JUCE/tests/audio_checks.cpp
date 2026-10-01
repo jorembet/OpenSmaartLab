@@ -686,6 +686,80 @@ int main()
                  "A single transient must lift the peak far above the RMS");
     }
 
+    // ---- Pink noise must sit inside 20 Hz to 20 kHz ----
+    {
+        SignalGenerator generator;
+        generator.prepare (rate);
+        generator.setType (SignalGenerator::Type::Pink);
+        generator.setLevelDb (-13.5f);
+
+        require (std::abs (generator.getBandLow() - 20.0f) < 0.01f
+                 && std::abs (generator.getBandHigh() - 20000.0f) < 0.01f,
+                 "The default generator band must be 20 Hz to 20 kHz");
+
+        generator.setRunning (true);
+        std::vector<float> out ((size_t) size * 4);
+        for (int block = 0; block < 4; ++block)
+            generator.process (out.data() + (size_t) block * size, size);
+
+        dsp::BlockAnalyser analyser;
+        analyser.prepare (rate, (int) out.size());
+        dsp::Spectrum produced;
+        analyser.analyse (out.data(), produced);
+
+        double below = 0.0, within = 0.0, above = 0.0;
+
+        for (size_t i = 0; i < produced.freq.size(); ++i)
+        {
+            const auto power = std::pow (10.0, produced.magnitudeDb[i] / 10.0);
+
+            if (produced.freq[i] < 20.0f)                    below += power;
+            else if (produced.freq[i] <= 20000.0f)            within += power;
+            else                                               above += power;
+        }
+
+        const auto total = below + within + above;
+        require (within / total > 0.95, "Over 95% of pink noise power must fall inside 20 Hz to 20 kHz");
+        require (below / total < 0.02, "Almost no power may remain below 20 Hz");
+        require (above / total < 0.02, "Almost no power may remain above 20 kHz");
+
+        // The band edges must actually carry signal, not merely be un-wasted.
+        const auto octaveRms = [&produced] (float low, float high)
+        {
+            double power = 0.0;
+            auto bins = 0;
+
+            for (size_t i = 0; i < produced.freq.size(); ++i)
+                if (produced.freq[i] >= low && produced.freq[i] < high)
+                {
+                    power += std::pow (10.0, produced.magnitudeDb[i] / 10.0);
+                    ++bins;
+                }
+
+            return bins > 0 ? dsp::db10 ((float) (power / bins)) : dsp::dbFloor;
+        };
+
+        require (octaveRms (25.0f, 31.5f) > dsp::dbFloor + 20.0f,
+                 "The 25 Hz octave must carry signal, so the band is not clipped away");
+        require (octaveRms (16000.0f, 20000.0f) > dsp::dbFloor + 20.0f,
+                 "The 16-20 kHz octave must carry signal");
+
+        // Pink means -3 dB per octave; a tapering that flattened the tilt would be wrong.
+        const auto lowOctave = octaveRms (25.0f, 31.5f);
+        const auto highOctave = octaveRms (16000.0f, 20000.0f);
+        const auto perOctave = (highOctave - lowOctave) / 9.3;
+        require (perOctave < -2.0 && perOctave > -4.0,
+                 "Pink noise must keep its -3 dB per octave tilt across the band");
+
+        // The band limits must be adjustable and the noise must follow.
+        generator.setBandLimits (100.0f, 10000.0f);
+        require (std::abs (generator.getBandLow() - 100.0f) < 0.01f
+                 && std::abs (generator.getBandHigh() - 10000.0f) < 0.01f,
+                 "Band limits must be adjustable");
+
+        generator.setRunning (false);
+    }
+
     // ---- Manual generator frequency ----
     // A typed frequency has to survive unchanged: measurement work needs 997 Hz to
     // stay 997 Hz, not be rounded to the nearest slider step.
@@ -787,6 +861,7 @@ int main()
     std::cout << "PASS: frequency labels are bold, sized for the row, and all 31 fit at 1/3 octave\n";
     std::cout << "PASS: RTA RMS/peak figures are 3.01 dB apart on a full-scale sine and hide silence\n";
     std::cout << "PASS: typed generator frequencies are applied exactly and out-of-range values clamp\n";
+    std::cout << "PASS: pink noise puts 95%+ of its power inside 20 Hz - 20 kHz and keeps its tilt\n";
     std::cout << "PASS: ISO 266 nominal 1/3 octave table exact; 1/1..1/12 octave counts 11/21/31/41/61/121 strictly increasing\n";
     std::cout << "PASS: bars tile 20 Hz to 20 kHz with no clipping and every centre inside its bar\n";
     std::cout << "PASS: octave bands reject DC offset while keeping the floor level\n";

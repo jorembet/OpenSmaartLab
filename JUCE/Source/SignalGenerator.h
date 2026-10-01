@@ -34,6 +34,11 @@ public:
     float getSweepDuration() const { return sweepDuration; }
     float getSweepProgress() const { return sweepProgress; }
 
+    /** Band limits used for pink noise and for the default sweep range. */
+    void setBandLimits (float lowFrequency, float highFrequency);
+    float getBandLow() const { return bandLow; }
+    float getBandHigh() const { return bandHigh; }
+
     void setRunning(bool shouldRun);
     bool isRunning() const { return running; }
 
@@ -52,6 +57,14 @@ private:
     float sweepEnd = 20000.0f;
     float sweepDuration = 10.0f;
     float sweepProgress = 0.0f;
+
+    // Pink noise covers the audible band. Below 20 Hz most speakers barely move and
+    // the power is wasted; above 20 kHz it is inaudible and only stresses the
+    // converter.
+    float pinkLowFrequency = 20.0f;
+    float pinkHighFrequency = 20000.0f;
+    float bandLow = 20.0f;
+    float bandHigh = 20000.0f;
 
     bool running = false;
     bool prepared = false;
