@@ -35,7 +35,10 @@ private:
     void clearSnapshotClicked();
     void updateCalibrationLabel();
     void applyTypedFrequency();
+    void applyTypedBandLow();
+    bool isEditingGeneratorBandLow() const;
     void updateGeneratorFrequencyEditor();
+    void updateGeneratorBandLowEditor();
     bool isEditingGeneratorFrequency() const;
     void updateGeneratorGeneratorControls();
     void populateSnapshotMenu();
@@ -121,8 +124,13 @@ private:
     };
 
     juce::TextEditor generatorFrequencyEditor;
+    juce::TextEditor generatorBandLowEditor;
+    juce::Slider generatorBandLowSlider;
+    juce::Label generatorBandLowLabel;
     FrequencyEditorListener frequencyEditorListener { *this };
+    FrequencyEditorListener bandLowEditorListener { *this };
     bool frequencyEditorActive = false;
+    bool bandLowEditorActive = false;
     juce::Slider generatorSweepStartSlider;
     juce::Slider generatorSweepEndSlider;
     juce::Slider generatorSweepDurationSlider;

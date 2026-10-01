@@ -6,9 +6,18 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 
-# JUCE build output
+# JUCE build output. Both an in-tree and a separate build directory are covered,
+# since cmake can be run from JUCE/ as well as JUCE/build/.
 JUCE/build/
 JUCE/.cache/
+JUCE/CMakeCache.txt
+JUCE/CMakeFiles/
+JUCE/CTestTestfile.cmake
+JUCE/DartConfiguration.tcl
+JUCE/Makefile
+JUCE/cmake_install.cmake
+JUCE/_deps/
+JUCE/*_artefacts/
 *.o
 *.a
 
