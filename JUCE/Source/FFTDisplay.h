@@ -5,6 +5,7 @@
 #include <functional>
 #include <vector>
 #include "DSP.h"
+#include "FrequencyLabels.h"
 #include "MicrophoneCalibration.h"
 #include "RTASnapshot.h"
 
@@ -126,6 +127,9 @@ private:
     void drawCursor(juce::Graphics& g, const juce::Rectangle<float>& area);
     juce::String getAxisLabel() const;
     juce::String frequencyLabel(float freq) const;
+    juce::Font frequencyLabelFont() const;
+    float frequencyLabelHeight() const;
+    float frequencyLabelWidth(const juce::Rectangle<float>& area) const;
 
     void loadBarColours();
     void saveBarColours() const;

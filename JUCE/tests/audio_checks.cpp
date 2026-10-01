@@ -2,6 +2,7 @@
 #include "DSP.h"
 #include "MicrophoneCalibration.h"
 #include "RTASnapshot.h"
+#include "FrequencyLabels.h"
 #include <cstdlib>
 #include <iostream>
 #include <random>
@@ -640,8 +641,55 @@ int main()
                 "The first linear bar must still show the floor, not be discarded");
     }
 
+    // ---- Frequency labels must stay legible and not overlap ----
+    {
+        const auto typeface = FrequencyLabels::font();
+        require(typeface.getHeight() >= 12.0f,
+                "The frequency label font must be readable at the default window size");
+        require(typeface.isBold(), "The frequency label font must be bold to stand out from the grid");
+
+        const auto rowHeight = FrequencyLabels::height();
+        require(rowHeight > typeface.getHeight(),
+                "The label row must leave room for the comma in 31.5 and any descender");
+
+        const auto labelWidth = FrequencyLabels::width();
+        require(labelWidth > typeface.getStringWidth (juce::String ("12.5k")),
+                "The label box must fit the widest label in use");
+        require(FrequencyLabels::reservedSpace() > rowHeight,
+                "The reserved space below the plot must exceed the label row height");
+        require(FrequencyLabels::topOffset() > 0.0f,
+                "The label row must start below the plot edge");
+
+        // At the default 1920 px window, all 31 band labels must still fit at this
+        // font size. If this fails the labels would overlap and have to be thinned.
+        const auto centres = dsp::octaveBandFrequencies(3, 20.0f, 20000.0f);
+        constexpr float plotWidth = 1813.0f;
+
+        auto narrowest = std::numeric_limits<float>::max();
+
+        for (size_t i = 1; i < centres.size(); ++i)
+        {
+            const auto previous = std::log10 (centres[i - 1]);
+            const auto current = std::log10 (centres[i]);
+            const auto step = std::min (std::log10 (centres.back()) - std::log10 (centres.front())
+                                            / (float) (centres.size() - 1),
+                                        current - previous);
+
+            // Mirrors computeAxisDomain: the domain widens by half the tightest step.
+            const auto domain = (std::log10 (centres.back()) - std::log10 (centres.front())) + step;
+            narrowest = std::min (narrowest, step / domain * plotWidth);
+        }
+
+        require(narrowest >= labelWidth,
+                "All 31 band labels must fit at the larger font size on the default width");
+
+        // A narrower window is allowed to thin labels, but never to zero width.
+        require(FrequencyLabels::width() > 0.0f, "The label box width must stay positive");
+    }
+
     std::cout << "PASS: paired pink noise, stereo copies, mono microphone delay 64 ms, silence rejection, 31 bands\n";
     std::cout << "PASS: 100-bar linear RTA centres 119.9-19900 Hz, 1500 Hz tone detection, DC rejected\n";
+    std::cout << "PASS: frequency labels are bold, sized for the row, and all 31 fit at 1/3 octave\n";
     std::cout << "PASS: ISO 266 nominal 1/3 octave table exact; 1/1..1/12 octave counts 11/21/31/41/61/121 strictly increasing\n";
     std::cout << "PASS: bars tile 20 Hz to 20 kHz with no clipping and every centre inside its bar\n";
     std::cout << "PASS: octave bands reject DC offset while keeping the floor level\n";
