@@ -264,9 +264,16 @@ void FFTDisplay::setBarCalibrationFactor(float factor)
 
 void FFTDisplay::setMeasuredLevels(float rmsDb, float peakDb)
 {
-    measuredRmsDb = rmsDb;
-    measuredPeakDb = peakDb;
+    measLevels.rmsDb = rmsDb;
+    measLevels.peakDb = peakDb;
     levelsValid = rmsDb > dsp::dbFloor + 1.0f || peakDb > dsp::dbFloor + 1.0f;
+    repaint();
+}
+
+void FFTDisplay::setReferenceLevels(float rmsDb, float peakDb)
+{
+    refLevels.rmsDb = rmsDb;
+    refLevels.peakDb = peakDb;
     repaint();
 }
 
@@ -705,6 +712,17 @@ juce::String FFTDisplay::frequencyLabel(float freq) const
 
 // Horizontal frequency labels. The sizing rules live in FrequencyLabels so the
 // drawing code and the tests use the same numbers.
+// The readout colours match the trace swatches so the two can be linked at a glance.
+juce::Colour FFTDisplay::traceColourFor(size_t index) const
+{
+    juce::ScopedLock lock(dataLock);
+
+    if (index < display.traces.size())
+        return display.traces[index].colour;
+
+    return index == 0 ? channelOneColour : transferColour;
+}
+
 juce::Font FFTDisplay::frequencyLabelFont() const
 {
     return FrequencyLabels::font();
@@ -994,26 +1012,59 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
         legendX += 60.0f;
     }
 
-    // Overall RMS and peak of the measurement channel, shown beside the delay readout.
-    // These are broadband time-domain figures, so they describe the whole mic signal
-    // rather than any single band.
-    if (levelsValid)
-    {
-        const auto levelText = "RMS " + juce::String (measuredRmsDb, 1)
-                             + " dBFS   Peak " + juce::String (measuredPeakDb, 1) + " dBFS";
+    drawLevelReadout(g, area);
+}
 
-        g.setColour(mutedColour);
-        g.drawText (levelText, area.getX() - 6.0f, area.getBottom() - 40.0f,
-                    area.getWidth() - 8.0f, 18.0f, juce::Justification::centredRight);
+void FFTDisplay::drawLevelReadout(juce::Graphics& g, const juce::Rectangle<float>& area) const
+{
+    const auto right = area.getRight() - 6.0f;
+    auto y = area.getBottom() - 42.0f;
+
+    // One line per channel, Mic first, so the reading matches the trace colours.
+    // Both figures are named explicitly: "RMS -37.7 / -2.4 dBFS" reads as a ratio
+    // at a glance, and "dBFS" at the end could be mistaken for the Peak alone.
+    const auto line = [] (const ChannelLevels& levels)
+    {
+        return "RMS " + juce::String (levels.rmsDb, 1)
+             + "    Peak " + juce::String (levels.peakDb, 1) + " dBFS";
+    };
+
+    const auto aboveFloor = [this] (const ChannelLevels& l)
+    {
+        return l.rmsDb > dsp::dbFloor + 1.0f || l.peakDb > dsp::dbFloor + 1.0f;
+    };
+
+    g.setFont (juce::Font (13.0f, juce::Font::bold));
+
+    if (levelsValid && aboveFloor (measLevels))
+    {
+        g.setColour (traceColourFor (0));
+        g.drawText ("Mic", area.getX() + 10.0f, y, 40.0f, 18.0f, juce::Justification::centredLeft);
+        g.setColour (mutedColour);
+        g.drawText ("RMS " + line (measLevels), area.getX() + 52.0f, y,
+                    area.getWidth() - 70.0f, 18.0f, juce::Justification::centredRight);
+        y += 19.0f;
     }
 
-    g.setColour(mutedColour);
+    if (generatorReference && aboveFloor (refLevels))
+    {
+        g.setColour (traceColourFor (1));
+        g.drawText ("Output", area.getX() + 10.0f, y, 46.0f, 18.0f, juce::Justification::centredLeft);
+        g.setColour (mutedColour);
+        g.drawText ("RMS " + line (refLevels), area.getX() + 58.0f, y,
+                    area.getWidth() - 70.0f, 18.0f, juce::Justification::centredRight);
+    }
+
+    // The delay line stays where it was, just above the plot edge.
+    g.setFont (juce::Font (12.0f));
+    g.setColour (mutedColour);
     g.drawText(delayAvailable ? (generatorReference ? "Delay total " : "Delay ") + juce::String(delayMs, 3) + " ms   Coherence "
                    + juce::String(averageCoherence * 100.0f, 1) + " %"
                    : (generatorReference ? "Delay total -- : menunggu suara generator di microphone"
                                          : "Delay -- : perlu sinyal referensi di kanal lain"),
                area.getX() - 6.0f, area.getBottom() - 22.0f, area.getWidth() - 8.0f, 18.0f,
                juce::Justification::centredRight);
+    (void) right;
 }
 
 void FFTDisplay::drawCursor(juce::Graphics& g, const juce::Rectangle<float>& area)

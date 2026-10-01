@@ -74,10 +74,17 @@ public:
     void setDelayMs(float newDelayMs) { delayMs = newDelayMs; }
     void setAverageCoherence(float value) { averageCoherence = value; }
 
-    /** Overall RMS and peak of the measurement channel, in dBFS. */
+    /** Broadband RMS and peak per channel, in dBFS. */
+    struct ChannelLevels
+    {
+        float rmsDb = dsp::dbFloor;
+        float peakDb = dsp::dbFloor;
+    };
+
     void setMeasuredLevels(float rmsDb, float peakDb);
-    float getMeasuredRmsDb() const { return measuredRmsDb; }
-    float getMeasuredPeakDb() const { return measuredPeakDb; }
+    void setReferenceLevels(float rmsDb, float peakDb);
+    ChannelLevels getMeasuredLevels() const { return measLevels; }
+    ChannelLevels getReferenceLevels() const { return refLevels; }
     void setRunning(bool isNowRunning);
 
     float getTopDb() const { return topDb; }
@@ -131,6 +138,8 @@ private:
     void drawTraces(juce::Graphics& g, const juce::Rectangle<float>& area) const;
     void drawCursor(juce::Graphics& g, const juce::Rectangle<float>& area);
     juce::String getAxisLabel() const;
+    void drawLevelReadout(juce::Graphics& g, const juce::Rectangle<float>& area) const;
+    juce::Colour traceColourFor(size_t index) const;
     juce::String frequencyLabel(float freq) const;
     juce::Font frequencyLabelFont() const;
     float frequencyLabelHeight() const;
@@ -199,8 +208,8 @@ private:
     bool levelsValid = false;
     float delayMs = 0.0f;
     float averageCoherence = 0.0f;
-    float measuredRmsDb = dsp::dbFloor;
-    float measuredPeakDb = dsp::dbFloor;
+    ChannelLevels measLevels;
+    ChannelLevels refLevels;
 
     MicrophoneCalibration calibration;
     float barCalibrationFactor = 0.0f;

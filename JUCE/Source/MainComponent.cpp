@@ -657,11 +657,16 @@ void MainComponent::timerCallback()
     // Peak is sampled separately from the running total: RMS squares and averages, so
     // a single loud transient would be invisible in it.
     auto measuredPeak = 0.0f;
+    auto referencePeak = 0.0f;
 
-    for (const auto sample : meas)
-        measuredPeak = std::max (measuredPeak, std::abs (sample));
+    for (size_t i = 0; i < meas.size(); ++i)
+        measuredPeak = std::max (measuredPeak, std::abs (meas[i]));
+
+    for (size_t i = 0; i < ref.size(); ++i)
+        referencePeak = std::max (referencePeak, std::abs (ref[i]));
 
     fftDisplay.setMeasuredLevels (measuredLevel, dsp::db20 (measuredPeak));
+    fftDisplay.setReferenceLevels (referenceLevel, dsp::db20 (referencePeak));
 
     splMeter.process(ref.data(), meas.data(), (int) ref.size());
 
