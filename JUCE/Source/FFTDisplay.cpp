@@ -2,6 +2,7 @@
 
 namespace
 {
+    const juce::Colour spectrogramFloorColour = juce::Colour(0xff141a26);
     constexpr int linearBarCount = 100;
 
     const juce::Colour backgroundColour = juce::Colour(0xff111318);
@@ -62,10 +63,12 @@ FFTDisplay::FFTDisplay()
     styleSelector.addItem("Band oktaf", (int) Style::Bands);
     styleSelector.addItem("Bar linear 100", (int) Style::BarLinear);
     styleSelector.addItem("Line", (int) Style::Line);
+    styleSelector.addItem("Spektogram", (int) Style::Spectrogram);
     styleSelector.setSelectedId((int) style, juce::dontSendNotification);
     styleSelector.setTooltip("Band oktaf: puncak FFT per band 1/1 oktaf sampai 1/12 oktaf pada sumbu log. "
                              "Bar linear: 100 bar evenly spaced pada sumbu frekuensi linear 0-20 kHz. "
-                             "Line: spektrum FFT dengan smoothing pilihan.");
+                             "Line: spektrum FFT dengan smoothing pilihan. "
+                             "Spektogram: riwayat level bergeser, waktu ke kanan.");
     styleSelector.onChange = [this] { setStyle((Style) styleSelector.getSelectedId()); };
     addAndMakeVisible(styleSelector);
 
@@ -333,17 +336,52 @@ void FFTDisplay::setOctaveFraction(int fraction)
     }
 }
 
+void FFTDisplay::setRange(float top, float bottom)
+{
+    // The window has to stay a usable size and stay inside the level scale: a top above
+    // +12 dB would only add headroom, and a range narrower than 20 dB collapses the axis
+    // divisions onto one line and inverts the colour scale.
+    topDb = juce::jmin (12.0f, top);
+    bottomDb = juce::jmax (-160.0f, bottom);
+
+    if (bottomDb > topDb - 20.0f)
+        bottomDb = topDb - 20.0f;
+
+    displayDirty = true;
+    repaint();
+}
+
 void FFTDisplay::setStyle(Style newStyle)
 {
     if (style == newStyle)
         return;
 
     style = newStyle;
-    barStyle = newStyle != Style::Line;
+    barStyle = newStyle != Style::Line && newStyle != Style::Spectrogram;
     linearAxis = newStyle == Style::BarLinear;
     computeAxisDomain();
     styleSelector.setSelectedId((int) newStyle, juce::dontSendNotification);
     clearPeakHold();
+
+    // The history belongs to the view it was recorded for: a bar graph of another
+    // layout would be measured against the wrong time axis.
+    if (newStyle == Style::Spectrogram)
+    {
+        // Ready before the first frame arrives, so the scale is on screen straight away.
+        ensureSpectrogramSize();
+        bandSelector.setVisible(false);
+        octaveSelector.setVisible(false);
+    }
+    else
+    {
+        // The history belongs to the spectrogram: keeping it would hold a couple of
+        // megabytes for a view that is not on screen, and the time axis would silently
+        // continue from a moment the user had already left.
+        resetSpectrogram();
+        bandSelector.setVisible(true);
+        octaveSelector.setVisible(true);
+    }
+
     displayDirty = true;
     repaint();
 }
@@ -438,6 +476,11 @@ void FFTDisplay::pushData(const std::vector<float>& freq,
     current.coherence = coherence;
     current.binValid = binValid;
     current.valid = !freq.empty();
+
+    // One column per frame of live data, so the time axis is real time and not the
+    // refresh rate of the window.
+    if (style == Style::Spectrogram)
+        pushSpectrogramColumn(current);
 
     // Only the microphone channel is calibrated. The reference channel is usually a
     // loopback of the generator, so correcting it would break the transfer function.
@@ -784,6 +827,9 @@ void FFTDisplay::resized()
     outputColourButton.setBounds(controls.removeFromRight(58).reduced(8, 4));
     controls.removeFromLeft(4);
     micColourButton.setBounds(controls.removeFromRight(58).reduced(8, 4));
+
+    if (style == Style::Spectrogram)
+        ensureSpectrogramSize();
 }
 
 void FFTDisplay::paint(juce::Graphics& g)
@@ -797,13 +843,23 @@ void FFTDisplay::paint(juce::Graphics& g)
     if (displayDirty)
         rebuildDisplay();
 
-    drawGrid(g, area);
-    drawTraces(g, area);
+    if (style == Style::Spectrogram)
+        drawSpectrogram(g, area);
+    else
+    {
+        drawGrid(g, area);
+        drawTraces(g, area);
+    }
 
-    g.setColour(mutedColour);
-    g.setFont(juce::Font(12.0f));
-    g.drawText(getAxisLabel(), area.getX() - 44, area.getCentreY() - 10, 40, 20,
-               juce::Justification::centredRight);
+    // The spectrogram has no vertical value axis: the colour scale carries the dB, so a
+    // second label down the side would only say the same thing twice.
+    if (style != Style::Spectrogram)
+    {
+        g.setColour(mutedColour);
+        g.setFont(juce::Font(12.0f));
+        g.drawText(getAxisLabel(), area.getX() - 44, area.getCentreY() - 10, 40, 20,
+                   juce::Justification::centredRight);
+    }
 
     drawCursor(g, area);
 
@@ -813,6 +869,230 @@ void FFTDisplay::paint(juce::Graphics& g)
         g.setFont(juce::Font(20.0f));
         g.drawText("Tekan Mulai untuk menjalankan pengukuran", getLocalBounds().toFloat(),
                    juce::Justification::centred);
+    }
+}
+
+float FFTDisplay::rowFrequency(int row) const
+{
+    const auto fraction = juce::jlimit(0.0f, 1.0f, (float) row / (float) (spectrogramRows - 1));
+    return minFrequency * std::pow(maxFrequency / minFrequency, fraction);
+}
+
+juce::Colour FFTDisplay::spectrogramColourFor(float db) const
+{
+    // A heat ramp from cold to hot, with the floor still distinguishable from the panel:
+    // the band that has never been excited must not look like a low band.
+    struct Stop { float db; juce::Colour colour; };
+
+    const Stop ramp[] = {
+        { dsp::dbFloor, spectrogramFloorColour },
+        { -90.0f,     juce::Colour(0xff1b3a5c) },
+        { -70.0f,     juce::Colour(0xff1f7a8c) },
+        { -50.0f,     juce::Colour(0xff3fa34d) },
+        { -30.0f,     juce::Colour(0xffc9c94a) },
+        { -10.0f,     juce::Colour(0xffe07b39) },
+        { 0.0f,       juce::Colour(0xffe8453c) },
+        { 12.0f,      juce::Colour(0xfff5f5f5) }
+    };
+
+    const auto level = juce::jlimit(dsp::dbFloor, 12.0f, db);
+
+    for (size_t i = 1; i < std::size(ramp); ++i)
+    {
+        if (level > ramp[i].db)
+            continue;
+
+        const auto span = ramp[i].db - ramp[i - 1].db;
+
+        if (span <= 0.0f)
+            continue;
+
+        const auto fraction = (float) juce::jlimit(0.0f, 1.0f, (level - ramp[i - 1].db) / span);
+        return ramp[i - 1].colour.interpolatedWith(ramp[i].colour, fraction);
+    }
+
+    return ramp[std::size(ramp) - 1].colour;
+}
+
+float FFTDisplay::spectrogramBandLevel(const Frame& frame, int row) const
+{
+    if (frame.measDb.empty() || frame.freq.empty())
+        return dsp::dbFloor;
+
+    const auto low = rowFrequency(row);
+    const auto high = rowFrequency(row + 1);
+    double total = 0.0;
+    auto count = 0;
+
+    for (size_t i = 0; i < frame.freq.size(); ++i)
+    {
+        if (frame.freq[i] < low || frame.freq[i] > high)
+            continue;
+
+        total += std::pow(10.0, frame.measDb[i] / 10.0);
+        ++count;
+    }
+
+    // A band with no FFT bin in it still has a frequency of its own; reporting the floor
+    // keeps the history continuous instead of leaving holes that were never measured.
+    if (count == 0)
+        return dsp::dbFloor;
+
+    return dsp::db10((float) (total / (double) count));
+}
+
+void FFTDisplay::resetSpectrogram()
+{
+    spectrogramFront = {};
+    spectrogramBack = {};
+    spectrogramRows = 0;
+    spectrogramColumns = 0;
+    repaint();
+}
+
+void FFTDisplay::ensureSpectrogramSize()
+{
+    const auto plot = plotArea().toNearestInt();
+    const auto columns = juce::jlimit(120, 1600, plot.getWidth());
+    const auto rows = juce::jlimit(64, 800, plot.getHeight());
+
+    if (spectrogramFront.isValid() && spectrogramColumns == columns && spectrogramRows == rows)
+        return;
+
+    resetSpectrogram();
+
+    spectrogramColumns = columns;
+    spectrogramRows = rows;
+    historyDb.assign((size_t) columns * (size_t) rows, dsp::dbFloor);
+    spectrogramFront = juce::Image(juce::Image::ARGB, spectrogramColumns, spectrogramRows, true);
+    spectrogramBack = juce::Image(juce::Image::ARGB, spectrogramColumns, spectrogramRows, true);
+
+    // Starting from the floor colour rather than transparent black keeps a band that has
+    // not been excited visibly cold instead of showing the panel through.
+    for (auto* image : { &spectrogramFront, &spectrogramBack })
+    {
+        juce::Graphics g(*image);
+        g.fillAll(spectrogramFloorColour);
+    }
+
+    syncSpectrogramRange();
+}
+
+void FFTDisplay::syncSpectrogramRange() const
+{
+    if (! spectrogramFront.isValid())
+        return;
+
+    if (std::abs(spectrogramTopDb - topDb) < 0.01f
+        && std::abs(spectrogramBottomDb - bottomDb) < 0.01f)
+        return;
+
+    spectrogramTopDb = topDb;
+    spectrogramBottomDb = bottomDb;
+    recolourSpectrogram();
+}
+
+void FFTDisplay::recolourSpectrogram() const
+{
+    if (! spectrogramFront.isValid() || historyDb.empty())
+        return;
+
+    for (int x = 0; x < spectrogramColumns; ++x)
+    {
+        const auto sourceColumn = (historyHead + x) % spectrogramColumns;
+
+        for (int y = 0; y < spectrogramRows; ++y)
+        {
+            const auto db = historyDb[(size_t) sourceColumn * (size_t) spectrogramRows + (size_t) y];
+            spectrogramFront.setPixelAt(x, y, spectrogramColourFor(db));
+        }
+    }
+
+    juce::Graphics g(spectrogramBack);
+    g.drawImageAt(spectrogramFront, 0, 0);
+}
+
+void FFTDisplay::pushSpectrogramColumn(const Frame& frame)
+{
+    ensureSpectrogramSize();
+
+    if (! spectrogramFront.isValid())
+        return;
+
+    // Shift left one column and draw the new one at the right edge. The blit goes to the
+    // second image, because an image cannot be drawn onto itself.
+    {
+        juce::Graphics g(spectrogramBack);
+        g.drawImageAt(spectrogramFront, -1, 0);
+    }
+
+    for (int row = 0; row < spectrogramRows; ++row)
+    {
+        // Row 0 is 20 Hz and has to stay at the bottom of the picture, so the row index is
+        // flipped: the image is drawn top down while frequency runs upwards.
+        const auto level = spectrogramBandLevel(frame, spectrogramRows - 1 - row);
+
+        historyDb[(size_t) historyHead * (size_t) spectrogramRows + (size_t) row] = level;
+        spectrogramBack.setPixelAt(spectrogramColumns - 1, row, spectrogramColourFor(level));
+    }
+
+    historyHead = (historyHead + 1) % spectrogramColumns;
+    std::swap(spectrogramFront, spectrogramBack);
+    repaint();
+}
+
+void FFTDisplay::drawSpectrogram(juce::Graphics& g, const juce::Rectangle<float>& plotArea) const
+{
+    auto area = plotArea;
+
+    g.setColour(panelColour);
+    g.fillRect(area);
+
+    syncSpectrogramRange();
+
+    if (spectrogramFront.isValid())
+        g.drawImageAt(spectrogramFront, area.getX(), area.getY());
+
+    // A colour scale carrying the dB range, because a heat map without one is a picture
+    // rather than a measurement. It sits along the top, where the history is empty while
+    // a measurement starts.
+    const auto scaleRect = juce::Rectangle<float>(area.getX() + 8.0f, area.getY() + 8.0f,
+                                                  150.0f, 12.0f);
+
+    // Cold on the left, hot on the right, to match the labels underneath it.
+    for (int x = 0; x < (int) scaleRect.getWidth(); ++x)
+    {
+        const auto db = bottomDb + (topDb - bottomDb) * (float) x / std::max(1.0f, scaleRect.getWidth() - 1.0f);
+        g.setColour(spectrogramColourFor(db));
+        g.drawVerticalLine(juce::roundToInt(scaleRect.getX() + x), scaleRect.getY(),
+                            scaleRect.getBottom());
+    }
+
+    g.setColour(mutedColour);
+    g.setFont(juce::Font(11.0f));
+    g.drawText(juce::String((int) bottomDb) + " dB", scaleRect.getX(), scaleRect.getBottom() + 2.0f,
+               60.0f, 14.0f, juce::Justification::centredLeft);
+    g.drawText(juce::String((int) topDb) + " dB", scaleRect.getRight() - 60.0f,
+               scaleRect.getBottom() + 2.0f, 60.0f, 14.0f, juce::Justification::centredRight);
+
+    // The frequency axis has to be there too, or the history is a picture with no scale
+    // on either axis.
+    g.setFont(frequencyLabelFont());
+
+    for (const auto frequency : dsp::logAxisTicks(minFrequency, maxFrequency,
+                                                  std::max (2, (int) (area.getWidth() / 62.0f))))
+    {
+        const auto x = frequencyToX(frequency, area);
+
+        g.setColour(gridBoldColour.withAlpha(0.35f));
+        g.drawVerticalLine(juce::roundToInt(x), area.getY(), area.getBottom());
+
+        g.setColour(mutedColour);
+        const auto labelWidth = frequencyLabelWidth(area);
+        g.drawText(dsp::frequencyTickLabel(frequency),
+                   juce::jlimit(area.getX(), area.getRight() - labelWidth, x - labelWidth * 0.5f),
+                   area.getBottom() + FrequencyLabels::topOffset(),
+                   labelWidth, frequencyLabelHeight(), juce::Justification::centred);
     }
 }
 
