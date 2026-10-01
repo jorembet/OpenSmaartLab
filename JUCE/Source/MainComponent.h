@@ -35,7 +35,11 @@ private:
     void clearSnapshotClicked();
     void updateCalibrationLabel();
     void populateSnapshotMenu();
+    void chooseSnapshotFile();
+    void loadSnapshotFile (const juce::File& file);
+    juce::Array<juce::File> collectSnapshots() const;
     juce::File snapshotsDirectory() const;
+    juce::File lastSnapshotDirectory() const;
     static juce::String sanitiseName (const juce::String& name);
     void applyCalibrationToSplMeter();
     void generatorToggled();
@@ -76,6 +80,8 @@ private:
     juce::TextButton saveSnapshotButton { "Simpan RTA" };
     juce::TextButton loadSnapshotButton { "Load RTA" };
     juce::PopupMenu snapshotMenu;
+    juce::Array<juce::File> snapshotFiles;
+    juce::File lastSnapshotFolder;
     juce::Label calibrationLabel;
     MicrophoneCalibration microphoneCalibration;
 

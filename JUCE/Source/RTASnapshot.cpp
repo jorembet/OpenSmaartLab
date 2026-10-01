@@ -120,6 +120,10 @@ bool RTASnapshot::writeTo(const juce::File& file) const
     if (! isUsable())
         return false;
 
+    // FileOutputStream fails when the parent directory is missing, which is the
+    // common case for a first save into a new folder.
+    file.getParentDirectory().create();
+
     juce::FileOutputStream stream (file);
 
     if (! stream.openedOk())

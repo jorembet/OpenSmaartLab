@@ -857,6 +857,29 @@ juce::File MainComponent::snapshotsDirectory() const
              .getChildFile ("RTA");
 }
 
+// Where the user last saved, remembered so the load list and the file chooser can
+// start there rather than always falling back to the default folder.
+juce::File MainComponent::lastSnapshotDirectory() const
+{
+    if (lastSnapshotFolder.isDirectory())
+        return lastSnapshotFolder;
+
+    // Nothing remembered yet: look where snapshots tend to end up, including a
+    // folder named AUDIO in the home directory, which is a common choice.
+    const auto home = juce::File::getSpecialLocation (juce::File::userHomeDirectory);
+
+    for (const auto& name : { juce::String ("AUDIO"), juce::String ("RTA") })
+    {
+        const auto candidate = home.getChildFile (name);
+
+        if (candidate.isDirectory()
+             && ! candidate.findChildFiles (juce::File::findFiles, false, "*.rta.csv").isEmpty())
+            return candidate;
+    }
+
+    return snapshotsDirectory();
+}
+
 juce::String MainComponent::sanitiseName(const juce::String& name)
 {
     auto cleaned = name.trim();
@@ -895,6 +918,10 @@ void MainComponent::saveSnapshotClicked()
 
                              file.getParentDirectory().create();
 
+                             // writeTo creates the parent directory itself, but doing it here as well means the
+                             // failure is reported before any chooser work.
+                             file.getParentDirectory().create();
+
                              if (! fftDisplay.writeSnapshotTo (file))
                              {
                                  statusLabel.setText ("Gagal menyimpan RTA ke " + file.getFullPathName(),
@@ -902,29 +929,79 @@ void MainComponent::saveSnapshotClicked()
                                  return;
                              }
 
-                             statusLabel.setText ("RTA disimpan: " + file.getFileName(),
+                             lastSnapshotFolder = file.getParentDirectory();
+                             statusLabel.setText ("RTA disimpan: " + file.getFileName()
+                                                  + "  di " + file.getParentDirectory().getFullPathName(),
                                                   juce::dontSendNotification);
                          });
+}
+
+// Snapshot files are listed from two places: the default folder, and the folder the
+// user actually saved into. Saving goes through a file chooser, so files can land
+// anywhere, and a list built from one hardcoded folder would miss them.
+juce::Array<juce::File> MainComponent::collectSnapshots() const
+{
+    juce::Array<juce::File> found;
+
+    const auto addFrom = [&found] (const juce::File& directory)
+    {
+        if (! directory.isDirectory())
+            return;
+
+        // Newest first, so the most recent measurement is the first thing offered.
+        auto files = directory.findChildFiles (juce::File::findFiles, false, "*.rta.csv");
+        struct NewestFirst
+        {
+            static int compareElements (const juce::File& a, const juce::File& b)
+            {
+                if (a.getLastModificationTime() == b.getLastModificationTime())
+                    return 0;
+
+                return a.getLastModificationTime() > b.getLastModificationTime() ? -1 : 1;
+            }
+        };
+
+        NewestFirst newestFirst;
+        files.sort (newestFirst);
+
+        for (const auto& file : files)
+            if (! found.contains (file))
+                found.add (file);
+    };
+
+    addFrom (snapshotsDirectory());
+    addFrom (lastSnapshotDirectory());
+
+    return found;
 }
 
 void MainComponent::populateSnapshotMenu()
 {
     snapshotMenu.clear();
     snapshotMenu.addItem (1, "Hapus tampilan RTA tersimpan");
+    snapshotMenu.addItem (2, "Pilih folder lain...");
+    snapshotMenu.addSeparator();
 
-    const auto directory = snapshotsDirectory();
-    const auto files = directory.findChildFiles (juce::File::findFiles, false, "*.csv");
+    snapshotFiles = collectSnapshots();
 
-    if (files.isEmpty())
+    if (snapshotFiles.isEmpty())
     {
-        snapshotMenu.addItem (2, "(belum ada RTA tersimpan)", false);
+        snapshotMenu.addItem (3, "(belum ada RTA tersimpan)", false);
         return;
     }
 
-    snapshotMenu.addSeparator();
+    for (int i = 0; i < snapshotFiles.size(); ++i)
+    {
+        const auto& file = snapshotFiles[i];
+        auto label = file.getFileName();
 
-    for (int i = 0; i < files.size(); ++i)
-        snapshotMenu.addItem (10 + i, files[i].getFileName());
+        // Include the folder when it is not the default one, otherwise the list is
+        // ambiguous once files from two directories are mixed.
+        if (file.getParentDirectory() != snapshotsDirectory())
+            label = file.getParentDirectory().getFileName() + "/" + label;
+
+        snapshotMenu.addItem (10 + i, label);
+    }
 }
 
 void MainComponent::loadSnapshotClicked()
@@ -942,30 +1019,77 @@ void MainComponent::loadSnapshotClicked()
                                         return;
                                     }
 
-                                    if (result < 10)
-                                        return;
-
-                                    const auto files = snapshotsDirectory().findChildFiles (juce::File::findFiles, false, "*.csv");
-                                    const auto index = result - 10;
-
-                                    if (index < 0 || index >= files.size())
-                                        return;
-
-                                    RTASnapshot loaded;
-
-                                    if (! RTASnapshot::readFrom (files[index], loaded))
+                                    if (result == 2)
                                     {
-                                        statusLabel.setText ("Gagal membaca " + files[index].getFileName(),
-                                                             juce::dontSendNotification);
+                                        chooseSnapshotFile();
                                         return;
                                     }
 
-                                    fftDisplay.showSnapshot (loaded);
-                                    statusLabel.setText ("Memuat RTA: " + loaded.name
-                                                         + (loaded.calibrationText.isNotEmpty()
-                                                                ? " (" + loaded.calibrationText + ")" : ""),
-                                                         juce::dontSendNotification);
+                                    if (result < 10 || result - 10 >= snapshotFiles.size())
+                                        return;
+
+                                    loadSnapshotFile (snapshotFiles[result - 10]);
                                 });
+}
+
+void MainComponent::chooseSnapshotFile()
+{
+    // Start where the files were last saved, so repeat loads do not begin at Home.
+    auto startDirectory = snapshotsDirectory();
+
+    if (startDirectory.isDirectory())
+        startDirectory = lastSnapshotDirectory();
+    else if (lastSnapshotDirectory().isDirectory())
+        startDirectory = lastSnapshotDirectory();
+
+    auto* chooser = new juce::FileChooser ("Muat hasil RTA tersimpan", startDirectory,
+                                          "*.rta.csv;*.csv");
+
+    chooser->launchAsync (juce::FileBrowserComponent::openMode
+                             | juce::FileBrowserComponent::canSelectFiles,
+                         [this, chooser] (const juce::FileChooser& fc)
+                         {
+                             const auto file = fc.getResult();
+                             delete chooser;
+
+                             if (file == juce::File())
+                                 return;
+
+                             loadSnapshotFile (file);
+                         });
+}
+
+void MainComponent::loadSnapshotFile(const juce::File& file)
+{
+    if (! file.existsAsFile())
+    {
+        statusLabel.setText ("File tidak ditemukan: " + file.getFullPathName(),
+                             juce::dontSendNotification);
+        return;
+    }
+
+    RTASnapshot loaded;
+
+    if (! RTASnapshot::readFrom (file, loaded))
+    {
+        statusLabel.setText ("Gagal membaca " + file.getFileName()
+                             + ": format bukan hasil simpan RTA",
+                             juce::dontSendNotification);
+        return;
+    }
+
+    fftDisplay.showSnapshot (loaded);
+    lastSnapshotFolder = file.getParentDirectory();
+
+    auto message = juce::String ("Memuat RTA: ") + loaded.name
+                 + juce::String ("  (") + juce::String ((int) loaded.frequency.size()) + " titik, "
+                 + juce::String ((int) loaded.traces.size()) + " kanal) dari "
+                 + file.getFileName();
+
+    if (loaded.calibrationText.isNotEmpty())
+        message += "  [" + loaded.calibrationText + "]";
+
+    statusLabel.setText (message, juce::dontSendNotification);
 }
 
 void MainComponent::exportCSVClicked()
