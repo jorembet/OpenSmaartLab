@@ -602,10 +602,13 @@ void AudioEngine::start(const juce::String& inputDeviceName,
     setup.sampleRate = std::max(8000.0, sampleRate);
     setup.bufferSize = juce::jlimit(16, 8192, bufferSize);
 
+    // Two input channels and two output channels are opened, and the routing decides what
+    // each of them carries. Opening only one output would leave the left/right routing
+    // with nothing to separate.
     setup.useDefaultInputChannels = false;
     setup.inputChannels = juce::BigInteger(3);
     setup.useDefaultOutputChannels = false;
-    setup.outputChannels = juce::BigInteger(1);
+    setup.outputChannels = juce::BigInteger(3);
 
     auto error = deviceManager.setAudioDeviceSetup(setup, true);
 
