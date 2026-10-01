@@ -549,7 +549,11 @@ juce::Rectangle<float> FFTDisplay::plotArea() const
 {
     auto area = getLocalBounds().toFloat();
     area.removeFromTop(40.0f);
-    area = area.reduced(24.0f, 18.0f).withTrimmedLeft(46.0f).withTrimmedBottom(18.0f);
+    // Room is reserved below the plot for the frequency label row, which is taller
+    // than the 18 pt this used to allow.
+    area = area.reduced (24.0f, 18.0f)
+               .withTrimmedLeft (46.0f)
+               .withTrimmedBottom (FrequencyLabels::reservedSpace());
 
     return area;
 }
@@ -691,6 +695,24 @@ juce::String FFTDisplay::frequencyLabel(float freq) const
     return juce::String(freq, std::fmod(freq, 1.0f) > 0.05f ? 1 : 0);
 }
 
+// Horizontal frequency labels. The sizing rules live in FrequencyLabels so the
+// drawing code and the tests use the same numbers.
+juce::Font FFTDisplay::frequencyLabelFont() const
+{
+    return FrequencyLabels::font();
+}
+
+float FFTDisplay::frequencyLabelHeight() const
+{
+    return FrequencyLabels::height();
+}
+
+float FFTDisplay::frequencyLabelWidth(const juce::Rectangle<float>& area) const
+{
+    juce::ignoreUnused (area);
+    return FrequencyLabels::width();
+}
+
 juce::String FFTDisplay::getAxisLabel() const
 {
     switch (display.axis)
@@ -806,6 +828,8 @@ void FFTDisplay::drawGrid(juce::Graphics& g, const juce::Rectangle<float>& area)
         }
     }
 
+    const auto labelWidth = frequencyLabelWidth (area);
+
     if (linearAxis)
     {
         for (int hz = 2000; hz <= (int) maxFrequency; hz += 2000)
@@ -814,9 +838,10 @@ void FFTDisplay::drawGrid(juce::Graphics& g, const juce::Rectangle<float>& area)
             g.setColour(gridColour);
             g.fillRect(x, area.getY(), 1.0f, area.getHeight());
             g.setColour(mutedColour);
-            g.setFont(juce::Font(10.0f));
-            g.drawText(juce::String(hz / 1000) + "k", x - 22.0f, area.getBottom() + 3.0f,
-                       44.0f, 13.0f, juce::Justification::centred);
+            g.setFont (frequencyLabelFont());
+            g.drawText(juce::String(hz / 1000) + "k", x - labelWidth * 0.5f,
+                       area.getBottom() + FrequencyLabels::topOffset(),
+                       labelWidth, frequencyLabelHeight(), juce::Justification::centred);
         }
     }
     else
@@ -824,7 +849,6 @@ void FFTDisplay::drawGrid(juce::Graphics& g, const juce::Rectangle<float>& area)
         // Every band gets a frequency label. Labels are skipped only when the plot is
         // too narrow to fit them all without overlap.
         const auto count = bandFrequencies.size();
-        const auto labelWidth = 34.0f;
         const auto stride = juce::jmax (1, (int) std::ceil (labelWidth / minimumLabelSpacing (area)));
 
         for (size_t band = 0; band < count; ++band)
@@ -840,9 +864,10 @@ void FFTDisplay::drawGrid(juce::Graphics& g, const juce::Rectangle<float>& area)
                 continue;
 
             g.setColour(mutedColour);
-            g.setFont(juce::Font(9.0f));
-            g.drawText(frequencyLabel(freq), x - labelWidth * 0.5f, area.getBottom() + 2.0f,
-                       labelWidth, 12.0f, juce::Justification::centred);
+            g.setFont (frequencyLabelFont());
+            g.drawText(frequencyLabel(freq), x - labelWidth * 0.5f,
+                       area.getBottom() + FrequencyLabels::topOffset(),
+                       labelWidth, frequencyLabelHeight(), juce::Justification::centred);
         }
     }
 
