@@ -1,0 +1,1116 @@
+#include "MainComponent.h"
+#include "DSP.h"
+
+namespace
+{
+    const juce::Colour backgroundColour = juce::Colour(0xff111318);
+    const juce::Colour barColour = juce::Colour(0xff1b1f27);
+    const juce::Colour textColour = juce::Colour(0xffe6e9ef);
+    const juce::Colour mutedColour = juce::Colour(0xff8892a0);
+    const juce::Colour runningColour = juce::Colour(0xff43a047);
+    const juce::Colour stoppedColour = juce::Colour(0xffe53935);
+}
+
+MainComponent::MainComponent()
+{
+    setSize(1480, 920);
+    generatorDelayFinder.prepare(65536);
+    pinkNoiseButton.onClick = [this] { playPinkNoise(); };
+    pinkNoiseLevel.setRange(-60.0, -3.0, 0.5);
+    pinkNoiseLevel.setValue(-24.0, juce::dontSendNotification);
+    pinkNoiseLevel.setTextValueSuffix(" dBFS");
+    pinkNoiseLevel.setSliderStyle(juce::Slider::LinearHorizontal);
+    pinkNoiseLevel.setTextBoxStyle(juce::Slider::TextBoxRight, false, 85, 24);
+    pinkNoiseLevel.setTooltip("Level pink noise yang dikirim ke perangkat Output / Putar");
+    pinkNoiseLevel.onValueChange = [this] { generatorLevelSlider.setValue(pinkNoiseLevel.getValue()); };
+    addAndMakeVisible(pinkNoiseButton);
+    addAndMakeVisible(pinkNoiseLevel);
+    addAndMakeVisible(pinkNoiseHint);
+
+    audioEngine.onStatusMessage = [this] (const juce::String& text)
+    {
+        statusLabel.setText(text, juce::dontSendNotification);
+    };
+
+    fftSizeSelector.addItem("1024", 1024);
+    fftSizeSelector.addItem("2048", 2048);
+    fftSizeSelector.addItem("4096", 4096);
+    fftSizeSelector.addItem("8192", 8192);
+    fftSizeSelector.addItem("16384", 16384);
+    fftSizeSelector.addItem("32768", 32768);
+    fftSizeSelector.addItem("65536", 65536);
+    fftSizeSelector.setSelectedId(fftSize);
+    fftSizeSelector.onChange = [this] { analysisSettingsChanged(); };
+
+    averagingSelector.addItem("1", 1);
+    averagingSelector.addItem("2", 2);
+    averagingSelector.addItem("4", 4);
+    averagingSelector.addItem("8", 8);
+    averagingSelector.addItem("16", 16);
+    averagingSelector.addItem("32", 32);
+    averagingSelector.addItem("64", 64);
+    averagingSelector.addItem("128", 128);
+    averagingSelector.setSelectedId(8);
+    averagingSelector.onChange = [this]
+    {
+        referenceFrames = 0;
+        transferFunction.setAveraging(averagingSelector.getSelectedId());
+    };
+
+    inputSelector.onChange = [this] { inputSelector.setTooltip(inputSelector.getText()); };
+    outputSelector.onChange = [this] { outputSelector.setTooltip(outputSelector.getText()); };
+    sampleRateSelector.onChange = [this] { };
+    bufferSizeSelector.onChange = [this] { };
+
+    refreshButton.onClick = [this]
+    {
+        audioEngine.scanDevices();
+        refreshDeviceSelectors();
+    };
+
+    startStopButton.onClick = [this] { startStopClicked(); };
+    exportButton.onClick = [this] { exportCSVClicked(); };
+    calibrationButton.onClick = [this] { calibrationMenuClicked(); };
+    saveSnapshotButton.onClick = [this] { saveSnapshotClicked(); };
+    loadSnapshotButton.onClick = [this] { loadSnapshotClicked(); };
+    addAndMakeVisible (calibrationButton);
+    addAndMakeVisible (saveSnapshotButton);
+    addAndMakeVisible (loadSnapshotButton);
+    calibrationLabel.setFont (juce::Font (12.0f));
+    calibrationLabel.setColour (juce::Label::textColourId, mutedColour);
+    calibrationLabel.setJustificationType (juce::Justification::centredLeft);
+    addAndMakeVisible (calibrationLabel);
+    calibrationButton.setTooltip ("Kalibrasi mikrofon: pilih model, muat kurva CSV, atau matikan\n"
+                                 "Kalibrasi hanya diterapkan pada kanal Mic pada mode RTA Microphone");
+    saveSnapshotButton.setTooltip ("Simpan hasil RTA sekarang ke folder Documents/OpenSmaartLab/RTA");
+    loadSnapshotButton.setTooltip ("Muat kembali hasil RTA yang tersimpan, atau kembali ke RTA langsung");
+    // Calibration stays off by default. Turning it on converts dBFS into dB SPL,
+    // which lands far above the display range and pins every bar to the top, so it
+    // must be an explicit choice from the Kalibrasi Mic menu.
+    updateCalibrationLabel();
+    applyCalibrationToSplMeter();
+
+    microphoneChannel.addItem("Mic Ch1 / Ref Ch2", 1);
+    microphoneChannel.addItem("Mic Ch2 / Ref Ch1", 2);
+    microphoneChannel.setSelectedId(1, juce::dontSendNotification);
+    microphoneChannel.setTooltip("RTA memakai kanal Mic. Delay perlu referensi sinyal yang sama di kanal Ref.");
+    microphoneChannel.onChange = [this]
+    {
+        referenceFrames = 0;
+        transferFunction.reset();
+        fftDisplay.clearPeakHold();
+        fftDisplay.setDelayAvailable(false);
+        delayLabel.setText("Delay --", juce::dontSendNotification);
+    };
+    addAndMakeVisible(microphoneChannel);
+    addAndMakeVisible(inputLabel);
+    addAndMakeVisible(outputLabel);
+    inputSelector.setTitle("Input / Rekam");
+    outputSelector.setTitle("Output / Putar");
+    addAndMakeVisible(inputSelector);
+    addAndMakeVisible(outputSelector);
+    addAndMakeVisible(sampleRateSelector);
+    addAndMakeVisible(bufferSizeSelector);
+    addAndMakeVisible(fftSizeSelector);
+    addAndMakeVisible(averagingSelector);
+    addAndMakeVisible(refreshButton);
+    addAndMakeVisible(startStopButton);
+    addAndMakeVisible(exportButton);
+    addAndMakeVisible(statusLabel);
+    addAndMakeVisible(delayLabel);
+    addAndMakeVisible(coherenceLabel);
+
+    generatorTypeSelector.addItemList(SignalGenerator::getTypeNames(), 1);
+    generatorTypeSelector.setSelectedId(1);
+    generatorTypeSelector.onChange = [this]
+    {
+        const auto name = generatorTypeSelector.getText();
+        auto& generator = audioEngine.getGenerator();
+        generator.setType(SignalGenerator::typeFromName(name));
+        generatorDelayValid = false;
+        transferFunction.reset();
+        updateGeneratorInfo();
+    };
+
+    generatorLevelSlider.setRange(-60.0, 0.0, 0.5);
+    generatorLevelSlider.setValue(-24.0);
+    generatorLevelSlider.setTextValueSuffix(" dBFS");
+    generatorLevelSlider.onValueChange = [this]
+    {
+        audioEngine.getGenerator().setLevelDb((float) generatorLevelSlider.getValue());
+        pinkNoiseLevel.setValue(generatorLevelSlider.getValue(), juce::dontSendNotification);
+        updateGeneratorInfo();
+    };
+
+    generatorFrequencySlider.setRange(20.0, 20000.0, 1.0);
+    generatorFrequencySlider.setSkewFactorFromMidPoint(1000.0f);
+    generatorFrequencySlider.setValue(1000.0);
+    generatorFrequencySlider.setTextValueSuffix(" Hz");
+    generatorFrequencySlider.onValueChange = [this]
+    {
+        audioEngine.getGenerator().setFrequency((float) generatorFrequencySlider.getValue());
+        updateGeneratorInfo();
+    };
+
+    generatorSweepStartSlider.setRange(20.0, 2000.0, 1.0);
+    generatorSweepStartSlider.setValue(20.0, juce::dontSendNotification);
+    generatorSweepStartSlider.setTextValueSuffix(" Hz");
+    generatorSweepStartSlider.onValueChange = [this]
+    {
+        audioEngine.getGenerator().setSweepRange((float) generatorSweepStartSlider.getValue(),
+                                                (float) generatorSweepEndSlider.getValue(),
+                                                (float) generatorSweepDurationSlider.getValue());
+        updateGeneratorInfo();
+    };
+
+    generatorSweepEndSlider.setRange(2000.0, 20000.0, 10.0);
+    generatorSweepEndSlider.setValue(20000.0, juce::dontSendNotification);
+    generatorSweepEndSlider.setTextValueSuffix(" Hz");
+    generatorSweepEndSlider.onValueChange = [this]
+    {
+        audioEngine.getGenerator().setSweepRange((float) generatorSweepStartSlider.getValue(),
+                                                (float) generatorSweepEndSlider.getValue(),
+                                                (float) generatorSweepDurationSlider.getValue());
+        updateGeneratorInfo();
+    };
+
+    generatorSweepDurationSlider.setRange(1.0, 60.0, 0.5);
+    generatorSweepDurationSlider.setValue(10.0, juce::dontSendNotification);
+    generatorSweepDurationSlider.setTextValueSuffix(" s");
+    generatorSweepDurationSlider.onValueChange = [this]
+    {
+        audioEngine.getGenerator().setSweepRange((float) generatorSweepStartSlider.getValue(),
+                                                (float) generatorSweepEndSlider.getValue(),
+                                                (float) generatorSweepDurationSlider.getValue());
+        updateGeneratorInfo();
+    };
+
+    auto makeLabel = [this] (juce::Label& label, const juce::String& text)
+    {
+        label.setText(text, juce::dontSendNotification);
+        label.setFont(juce::Font(14.0f));
+        label.setColour(juce::Label::textColourId, mutedColour);
+        label.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(label);
+    };
+
+    makeLabel(generatorTypeLabel, "Jenis Sinyal");
+    makeLabel(generatorLevelLabel, "Level");
+    makeLabel(generatorFrequencyLabel, "Frekuensi");
+    makeLabel(generatorSweepStartLabel, "Sweep Mulai");
+    makeLabel(generatorSweepEndLabel, "Sweep Selesai");
+    makeLabel(generatorSweepDurationLabel, "Durasi Sweep");
+
+    generatorInfoLabel.setFont(juce::Font(14.0f));
+    generatorInfoLabel.setColour(juce::Label::textColourId, textColour);
+    generatorInfoLabel.setJustificationType(juce::Justification::topLeft);
+    addAndMakeVisible(generatorInfoLabel);
+
+    generatorButton.onClick = [this] { generatorToggled(); };
+
+    generatorPanel.addAndMakeVisible(generatorButton);
+    generatorPanel.addAndMakeVisible(generatorTypeSelector);
+    generatorPanel.addAndMakeVisible(generatorLevelSlider);
+    generatorPanel.addAndMakeVisible(generatorFrequencySlider);
+    generatorPanel.addAndMakeVisible(generatorSweepStartSlider);
+    generatorPanel.addAndMakeVisible(generatorSweepEndSlider);
+    generatorPanel.addAndMakeVisible(generatorSweepDurationSlider);
+    generatorPanel.addAndMakeVisible(generatorTypeLabel);
+    generatorPanel.addAndMakeVisible(generatorLevelLabel);
+    generatorPanel.addAndMakeVisible(generatorFrequencyLabel);
+    generatorPanel.addAndMakeVisible(generatorSweepStartLabel);
+    generatorPanel.addAndMakeVisible(generatorSweepEndLabel);
+    generatorPanel.addAndMakeVisible(generatorSweepDurationLabel);
+    generatorPanel.addAndMakeVisible(generatorInfoLabel);
+    generatorPanel.addAndMakeVisible(generatorDisplay);
+    generatorPanel.setInterceptsMouseClicks(false, true);
+
+    generatorPanel.addComponentListener(this);
+    addAndMakeVisible(tabs);
+    tabs.addTab("RTA / Delay", backgroundColour, &fftDisplay, false);
+    tabs.addTab("Reverberation", backgroundColour, &reverbDisplay, false);
+    tabs.addTab("SPL Meter", backgroundColour, &splMeter, false);
+    tabs.addTab("Generator", backgroundColour, &generatorPanel, false);
+
+    statusLabel.setFont(juce::Font(13.0f));
+    statusLabel.setColour(juce::Label::textColourId, mutedColour);
+    delayLabel.setFont(juce::Font(13.0f, juce::Font::bold));
+    delayLabel.setColour(juce::Label::textColourId, textColour);
+    delayLabel.setJustificationType(juce::Justification::centredRight);
+    coherenceLabel.setFont(juce::Font(13.0f, juce::Font::bold));
+    coherenceLabel.setColour(juce::Label::textColourId, textColour);
+    coherenceLabel.setJustificationType(juce::Justification::centredRight);
+
+    transferFunction.setAveraging(averagingSelector.getSelectedId());
+    transferFunction.setAutomaticDelay(true);
+    transferFunction.setDelayCompensation(true);
+
+    audioEngine.getGenerator().setType(SignalGenerator::Type::Pink);
+    audioEngine.getGenerator().setLevelDb(-24.0f);
+    audioEngine.getGenerator().setFrequency(1000.0f);
+    audioEngine.getGenerator().setSweepRange(20.0f, 20000.0f, 10.0f);
+
+    refreshDeviceSelectors();
+    updateGeneratorInfo();
+    updateStatus();
+
+    startTimerHz(30);
+}
+
+MainComponent::~MainComponent()
+{
+    generatorPanel.removeComponentListener(this);
+    stopTimer();
+    audioEngine.getGenerator().setRunning(false);
+    audioEngine.stop();
+}
+
+void MainComponent::refreshDeviceSelectors()
+{
+    const auto inputs = audioEngine.getInputDeviceLabels();
+    const auto outputs = audioEngine.getOutputDeviceLabels();
+
+    const auto previousInput = inputSelector.getSelectedId();
+    const auto previousOutput = outputSelector.getSelectedId();
+    const auto previousRate = sampleRateSelector.getSelectedId();
+    const auto previousBuffer = bufferSizeSelector.getSelectedId();
+
+    inputSelector.clear();
+    inputSelector.addItem("Input nonaktif", 1);
+
+    for (int i = 0; i < inputs.size(); ++i)
+        inputSelector.addItem(inputs[i], i + 2);
+
+    outputSelector.clear();
+    outputSelector.addItem("Output nonaktif", 1);
+
+    for (int i = 0; i < outputs.size(); ++i)
+        outputSelector.addItem(outputs[i], i + 2);
+
+    inputSelector.setSelectedId(previousInput > 1 && previousInput <= inputs.size() + 1
+                                    ? previousInput : juce::jmin(2, inputs.size() + 1),
+                                juce::sendNotification);
+    outputSelector.setSelectedId(previousOutput > 1 && previousOutput <= outputs.size() + 1
+                                    ? previousOutput : juce::jmin(2, outputs.size() + 1),
+                                juce::sendNotification);
+
+    sampleRateSelector.clear();
+    bufferSizeSelector.clear();
+
+    juce::Array<double> rates;
+    juce::Array<int> buffers;
+
+    auto& types = audioEngine.getDeviceManager().getAvailableDeviceTypes();
+
+    for (int i = 0; i < types.size() && rates.isEmpty(); ++i)
+    {
+        auto* type = types[i];
+
+        if (type == nullptr)
+            continue;
+
+        for (const auto& deviceName : type->getDeviceNames(false))
+        {
+            if (auto* device = type->createDevice(deviceName, deviceName))
+            {
+                rates = device->getAvailableSampleRates();
+                buffers = device->getAvailableBufferSizes();
+                delete device;
+                break;
+            }
+
+            if (auto* device = type->createDevice(deviceName, juce::String()))
+            {
+                rates = device->getAvailableSampleRates();
+                buffers = device->getAvailableBufferSizes();
+                delete device;
+                break;
+            }
+        }
+    }
+
+    if (auto* device = audioEngine.getDeviceManager().getCurrentAudioDevice())
+    {
+        rates = device->getAvailableSampleRates();
+        buffers = device->getAvailableBufferSizes();
+    }
+
+    if (rates.isEmpty())
+        rates.add(48000.0);
+
+    if (buffers.isEmpty())
+    {
+        buffers.add(256);
+        buffers.add(512);
+        buffers.add(1024);
+        buffers.add(2048);
+    }
+
+    int rateId = 0;
+
+    for (int i = 0; i < rates.size(); ++i)
+    {
+        sampleRateSelector.addItem(juce::String((int) rates[i]), i + 1);
+
+        if (rateId == 0 && rates[i] >= 48000.0)
+            rateId = i + 1;
+    }
+
+    if (rateId == 0 && rates.size() > 0)
+        rateId = 1;
+
+    sampleRateSelector.setSelectedId(previousRate > 0 && previousRate <= rates.size()
+                                        ? previousRate : rateId,
+                                    juce::sendNotification);
+
+    int bufferId = 0;
+
+    for (int i = 0; i < buffers.size(); ++i)
+    {
+        bufferSizeSelector.addItem(juce::String(buffers[i]), i + 1);
+
+        if (bufferId == 0 && buffers[i] >= 1024)
+            bufferId = i + 1;
+    }
+
+    if (bufferId == 0 && buffers.size() > 0)
+        bufferId = 1;
+
+    bufferSizeSelector.setSelectedId(previousBuffer > 0 && previousBuffer <= buffers.size()
+                                        ? previousBuffer : bufferId,
+                                    juce::sendNotification);
+}
+
+void MainComponent::analysisSettingsChanged()
+{
+    referenceFrames = 0;
+    fftSize = fftSizeSelector.getSelectedId();
+    fftSize = std::max(1024, fftSize);
+
+    const auto rate = (float) audioEngine.getSampleRate();
+
+    transferFunction.prepare(rate, fftSize);
+    transferFunction.setAveraging(averagingSelector.getSelectedId());
+
+    fftDisplay.clearPeakHold();
+    reverbDisplay.clear();
+
+    updateStatus();
+}
+
+void MainComponent::startStopClicked()
+{
+    if (isRunning)
+    {
+        audioEngine.stop();
+        audioEngine.getGenerator().setRunning(false);
+        generatorOn = false;
+        isRunning = false;
+
+        fftDisplay.setDelayAvailable(false);
+        delayLabel.setText("Delay --", juce::dontSendNotification);
+        fftDisplay.setRunning(false);
+        fftDisplay.pushData({}, {}, {}, {}, {}, {});
+        reverbDisplay.clear();
+        splMeter.reset();
+
+        startStopButton.setButtonText("Mulai");
+        startStopButton.setColour(juce::TextButton::buttonColourId, stoppedColour);
+        generatorButton.setButtonText("Nyalakan");
+        updateGeneratorInfo();
+        updateStatus();
+        return;
+    }
+
+    const auto inputIndex = inputSelector.getSelectedId() - 2;
+    const auto outputIndex = outputSelector.getSelectedId() - 2;
+
+    const auto& inputNames = audioEngine.getInputDeviceNames();
+    const auto& outputNames = audioEngine.getOutputDeviceNames();
+
+    const auto inputName = juce::isPositiveAndBelow(inputIndex, inputNames.size())
+                         ? inputNames[inputIndex] : juce::String();
+    const auto outputName = juce::isPositiveAndBelow(outputIndex, outputNames.size())
+                          ? outputNames[outputIndex] : juce::String();
+    const auto rate = sampleRateSelector.getSelectedId() > 0
+                    ? sampleRateSelector.getText().getDoubleValue() : 48000.0;
+    const auto bufferSize = bufferSizeSelector.getSelectedId() > 0
+                          ? bufferSizeSelector.getText().getIntValue() : 1024;
+
+    if (inputName.isEmpty())
+    {
+        statusLabel.setText("Pilih microphone pada Input / Rekam", juce::dontSendNotification);
+        return;
+    }
+    audioEngine.start(inputName, outputName, rate, bufferSize,
+                      audioEngine.getOutputPulseSink(outputIndex));
+
+    if (!audioEngine.isRunning())
+    {
+        startStopButton.setButtonText("Mulai");
+        fftDisplay.setDelayAvailable(false);
+        delayLabel.setText("Delay --", juce::dontSendNotification);
+        fftDisplay.setRunning(false);
+        updateStatus();
+        return;
+    }
+
+    referenceFrames = 0;
+    isRunning = true;
+    startStopButton.setButtonText("Berhenti");
+    startStopButton.setColour(juce::TextButton::buttonColourId, runningColour);
+
+    splMeter.prepare((float) audioEngine.getSampleRate(), 2048);
+    transferFunction.prepare((float) audioEngine.getSampleRate(), fftSize);
+    transferFunction.setAveraging(averagingSelector.getSelectedId());
+
+    tabs.setCurrentTabIndex(0);
+    fftDisplay.setDelayAvailable(false);
+    delayLabel.setText("Delay --", juce::dontSendNotification);
+    fftDisplay.setRunning(true);
+    fftDisplay.clearPeakHold();
+
+    updateStatus();
+}
+
+void MainComponent::playPinkNoise()
+{
+    if (generatorOn)
+    {
+        generatorToggled();
+        return;
+    }
+    if (outputSelector.getSelectedId() <= 1)
+    {
+        statusLabel.setText("Pilih speaker pada Output / Putar sebelum Play Pink Noise", juce::dontSendNotification);
+        return;
+    }
+    generatorTypeSelector.setSelectedId(1, juce::sendNotificationSync);
+    if (!isRunning)
+        startStopClicked();
+    if (isRunning)
+    {
+        generatorToggled();
+        tabs.setCurrentTabIndex(0);
+        fftDisplay.setMode(FFTDisplay::Mode::SingleChannel);
+    }
+}
+
+void MainComponent::generatorToggled()
+{
+    if (!isRunning || !audioEngine.isRunning())
+    {
+        generatorOn = false;
+        audioEngine.getGenerator().setRunning(false);
+        generatorDisplay.setRunning(false);
+        generatorInfoLabel.setColour(juce::Label::textColourId, stoppedColour);
+        generatorInfoLabel.setText("Audio belum berjalan - tekan Mulai dulu sebelum menyalakan generator",
+                                  juce::dontSendNotification);
+        generatorButton.setButtonText("Nyalakan");
+        generatorButton.setColour(juce::TextButton::buttonColourId, stoppedColour);
+        return;
+    }
+
+    if (!generatorOn)
+    {
+        auto* device = audioEngine.getDeviceManager().getCurrentAudioDevice();
+        if (device == nullptr || device->getActiveOutputChannels().isZero())
+        {
+            statusLabel.setText("Output belum aktif: pilih speaker, hentikan audio lalu tekan Play Pink Noise", juce::dontSendNotification);
+            return;
+        }
+    }
+    generatorOn = !generatorOn;
+    generatorDelayValid = false;
+    generatorDelayCounter = 0;
+    generatorStartedAt = juce::Time::getMillisecondCounterHiRes();
+    generatorDelayFinder.reset();
+    transferFunction.reset();
+    referenceFrames = 0;
+    fftDisplay.setDelayAvailable(false);
+    fftDisplay.clearPeakHold();
+    delayLabel.setText("Delay --", juce::dontSendNotification);
+
+    audioEngine.getGenerator().setRunning(generatorOn);
+    generatorDisplay.setRunning(generatorOn);
+    generatorButton.setButtonText(generatorOn ? "Matikan" : "Nyalakan");
+    generatorButton.setColour(juce::TextButton::buttonColourId,
+                              generatorOn ? runningColour : stoppedColour);
+
+    updateGeneratorInfo();
+}
+
+void MainComponent::updateGeneratorInfo()
+{
+    auto& generator = audioEngine.getGenerator();
+    pinkNoiseButton.setButtonText(generatorOn ? "Stop Generator" : "Play Pink Noise");
+    pinkNoiseButton.setColour(juce::TextButton::buttonColourId, generatorOn ? runningColour : barColour);
+    fftDisplay.showGeneratorReference(generatorOn);
+
+    if (!generatorOn)
+    {
+        generatorInfoLabel.setColour(juce::Label::textColourId, mutedColour);
+        generatorInfoLabel.setText("Generator mati", juce::dontSendNotification);
+        return;
+    }
+
+    generatorInfoLabel.setColour(juce::Label::textColourId, runningColour);
+    generatorInfoLabel.setText("Generator aktif - " + generatorTypeSelector.getText()
+                                   + "   level " + juce::String(generator.getLevelDb(), 1) + " dBFS",
+                               juce::dontSendNotification);
+}
+
+void MainComponent::updateGeneratorDisplay()
+{
+    auto& generator = audioEngine.getGenerator();
+
+    std::vector<float> output;
+    audioEngine.getGeneratorOutput(output);
+
+    const auto outputName = outputSelector.getSelectedId() > 1
+                          ? outputSelector.getText() : juce::String("-");
+
+    generatorDisplay.setSignal(generatorTypeSelector.getText(), (float) generatorLevelSlider.getValue(),
+                               generator.getSweepProgress(), outputName);
+    generatorDisplay.setSamples(output, (float) audioEngine.getSampleRate());
+}
+
+void MainComponent::updateStatus()
+{
+    if (isRunning)
+    {
+        statusLabel.setText("Running - " + inputSelector.getText()
+                            + " -> " + outputSelector.getText()
+                            + " @ " + juce::String((int) audioEngine.getSampleRate()) + " Hz",
+                            juce::dontSendNotification);
+        return;
+    }
+
+    statusLabel.setText("Berhenti - pilih device lalu tekan Mulai", juce::dontSendNotification);
+}
+
+void MainComponent::timerCallback()
+{
+    if (!isRunning)
+        return;
+
+    std::vector<float> ref;
+    std::vector<float> meas;
+
+    std::vector<float> generated;
+    audioEngine.getLatestBlock(generatorOn ? 65536 : transferFunction.getFftSize(), ref, meas, &generated);
+
+    if (ref.size() < (size_t) transferFunction.getFftSize() || meas.size() < (size_t) transferFunction.getFftSize())
+        return;
+
+    const auto channels = audioEngine.getCapturedChannels();
+    if (channels == 0)
+        return;
+    if (channels == 1)
+    {
+        // A mono microphone always supplies the measurement channel.
+        meas = ref;
+        std::fill(ref.begin(), ref.end(), 0.0f);
+    }
+    else if (microphoneChannel.getSelectedId() == 1)
+        std::swap(ref, meas);
+
+    const auto generatorType = audioEngine.getGenerator().getType();
+    const bool broadbandGenerator = generatorOn && (generatorType == SignalGenerator::Type::Pink
+                                                     || generatorType == SignalGenerator::Type::White);
+    if (generatorOn)
+    {
+        ref = generated;
+        const bool ready = broadbandGenerator && ref.size() == 65536
+                       && juce::Time::getMillisecondCounterHiRes() - generatorStartedAt
+                          > 1000.0 * 65536.0 / audioEngine.getSampleRate();
+        if (!ready)
+            generatorDelayValid = false;
+        else if (generatorDelayCounter++ % 8 == 0)
+        {
+            const auto lag = generatorDelayFinder.analyse(ref.data(), meas.data(),
+                                                          (float) audioEngine.getSampleRate(), 500.0f);
+            generatorDelayMs = lag * 1000.0f / (float) audioEngine.getSampleRate();
+            generatorDelayValid = generatorDelayMs >= 0.0f && generatorDelayMs < 499.0f
+                              && dsp::delayConfidence(ref, meas, juce::roundToInt(lag)) >= 0.2f;
+        }
+        const auto keep = (size_t) transferFunction.getFftSize();
+        if (ref.size() > keep)
+        {
+            ref.erase(ref.begin(), ref.end() - (ptrdiff_t) keep);
+            meas.erase(meas.begin(), meas.end() - (ptrdiff_t) keep);
+        }
+    }
+
+    double referenceEnergy = 0.0;
+    double measuredEnergy = 0.0;
+
+    for (size_t i = 0; i < ref.size(); ++i)
+    {
+        referenceEnergy += (double) ref[i] * ref[i];
+        measuredEnergy += (double) meas[i] * meas[i];
+    }
+
+    const auto referenceLevel = dsp::db10((float) (referenceEnergy / std::max<size_t>(1, ref.size())));
+    const auto measuredLevel = dsp::db10((float) (measuredEnergy / std::max<size_t>(1, meas.size())));
+
+    splMeter.process(ref.data(), meas.data(), (int) ref.size());
+
+    auto result = transferFunction.process(ref.data(), meas.data(), (int) ref.size());
+
+    if (!result.valid)
+        return;
+
+    const bool hasReference = (generatorOn || channels > 1) && referenceLevel > -80.0f && measuredLevel > -80.0f;
+    referenceFrames = hasReference ? referenceFrames + 1 : 0;
+    const bool delayAvailable = generatorOn ? hasReference && generatorDelayValid
+                             : referenceFrames >= 8 && hasReference && averagingSelector.getSelectedId() > 1
+                               && result.averageCoherence >= 0.5f;
+    if (generatorOn)
+        result.delayMs = generatorDelayMs;
+    fftDisplay.setDelayAvailable(delayAvailable);
+    if (!hasReference)
+    {
+        result.magnitudeDb.clear();
+        result.phaseDeg.clear();
+        result.coherence.clear();
+        result.impulseResponse.clear();
+        reverbDisplay.clear();
+    }
+    lastResult = result;
+    if (!delayAvailable)
+        lastResult.delayMs = std::numeric_limits<float>::quiet_NaN();
+    fftDisplay.setDelayMs(result.delayMs);
+    fftDisplay.setAverageCoherence(result.averageCoherence);
+    fftDisplay.pushData(result.freq, result.refMagnitudeDb, result.measMagnitudeDb,
+                        result.magnitudeDb, result.phaseDeg, result.coherence);
+
+    delayLabel.setText(delayAvailable ? (generatorOn ? "Total " : "Delay ") + juce::String(result.delayMs, 3) + " ms"
+                                    : (generatorOn ? "Total -- (menunggu mic)" : "Delay -- (perlu referensi)"),
+                       juce::dontSendNotification);
+
+    if (generatorOn && (reverbCounter % 2) == 0)
+        updateGeneratorDisplay();
+
+    const auto averages = averagingSelector.getSelectedId();
+
+    if (!hasReference)
+        coherenceLabel.setText("RTA microphone", juce::dontSendNotification);
+    else if (averages <= 1)
+        coherenceLabel.setText("Coherence perlu averaging > 1", juce::dontSendNotification);
+    else
+        coherenceLabel.setText("Coherence " + juce::String(result.averageCoherence * 100.0f, 1)
+                                   + " %   (avg " + juce::String(averages) + ")",
+                               juce::dontSendNotification);
+
+    if (generatorOn)
+        statusLabel.setText("Output -> Mic | " + juce::String(measuredLevel, 1)
+                            + " dBFS | Delay total termasuk latensi perangkat", juce::dontSendNotification);
+    else if (!hasReference)
+        statusLabel.setText("RTA Mic " + juce::String(measuredLevel, 1)
+                            + " dBFS - delay perlu loopback referensi pada kanal lain",
+                            juce::dontSendNotification);
+    else if (referenceLevel < -80.0f)
+        statusLabel.setText("Sinyal input terlalu kecil - naikkan gain atau gunakan loopback",
+                            juce::dontSendNotification);
+    else if (measuredLevel < -80.0f)
+        statusLabel.setText("Sinyal channel 2 kosong - cek loopback atau cabling input 2",
+                            juce::dontSendNotification);
+    else
+        statusLabel.setText("Ref " + juce::String(referenceLevel, 1) + " dBFS   Mic "
+                            + juce::String(measuredLevel, 1) + " dBFS   "
+                            + juce::String((int) transferFunction.getSampleRate()) + " Hz / "
+                            + juce::String(transferFunction.getFftSize()) + " FFT",
+                            juce::dontSendNotification);
+
+    if (hasReference && ++reverbCounter >= 5)
+    {
+        reverbCounter = 0;
+
+        const auto acoustics = ImpulseResponse::analyse(result.impulseResponse.data(),
+                                                        (int) result.impulseResponse.size(),
+                                                        result.sampleRate);
+        reverbDisplay.setAcoustics(acoustics, result.sampleRate);
+    }
+}
+
+void MainComponent::updateCalibrationLabel()
+{
+    calibrationLabel.setText (microphoneCalibration.toString(), juce::dontSendNotification);
+    fftDisplay.setMicrophoneCalibration (microphoneCalibration);
+    applyCalibrationToSplMeter();
+}
+
+void MainComponent::applyCalibrationToSplMeter()
+{
+    // The SPL meter already adds its own calibration offset to a 0 dBFS reference,
+    // so only the sensitivity step is handed over here.
+    const auto offset = microphoneCalibration.isEnabled() ? microphoneCalibration.getSensitivityDb()
+                                                           : 120.0f;
+    splMeter.setCalibrationOffset (offset);
+}
+
+void MainComponent::calibrationMenuClicked()
+{
+    juce::PopupMenu menu;
+    menu.addItem (1, "Tanpa kalibrasi (dBFS)", microphoneCalibration.getModelName() == "Tanpa kalibrasi");
+    menu.addItem (2, "Dayton Audio iMM-6c",
+                  microphoneCalibration.getModelName() == "Dayton Audio iMM-6c");
+    menu.addSeparator();
+    menu.addItem (3, "Muat kurva kalibrasi (TXT/CSV)...");
+    menu.addItem (4, "Reset kalibrasi", microphoneCalibration.getModelName() == "Tanpa kalibrasi");
+
+    menu.showMenuAsync (juce::PopupMenu::Options()
+                            .withTargetComponent (&calibrationButton),
+                        [this] (int result)
+                        {
+                            if (result == 1)
+                            {
+                                microphoneCalibration = MicrophoneCalibration();
+                            }
+                            else if (result == 2)
+                            {
+                                microphoneCalibration = MicrophoneCalibration::daytonImm6c();
+
+                                // SPL readings sit far above the default 0 to -120 dB
+                                // window, so the range has to follow the calibration.
+                                statusLabel.setText ("Kalibrasi aktif: level kini dB SPL, bukan dBFS. "
+                                                     "Pilih rentang display yang sesuai bila grafik terpotong",
+                                                     juce::dontSendNotification);
+                            }
+                            else if (result == 3)
+                            {
+                                // Dayton's download tool saves the file as .txt, so both are offered.
+                                auto* chooser = new juce::FileChooser ("Muat kurva kalibrasi mikrofon",
+                                                                          juce::File::getCurrentWorkingDirectory(),
+                                                                          "*.txt;*.csv;*.cal;*.dat");
+                                chooser->launchAsync (juce::FileBrowserComponent::openMode
+                                                          | juce::FileBrowserComponent::canSelectFiles,
+                                                      [this, chooser] (const juce::FileChooser& fc)
+                                                      {
+                                                          const auto file = fc.getResult();
+                                                          delete chooser;
+
+                                                          if (file == juce::File())
+                                                              return;
+
+                                                          if (! microphoneCalibration.loadFile (file))
+                                                          {
+                                                              statusLabel.setText ("Kurva kalibrasi gagal dibaca dari "
+                                                                                   + file.getFileName()
+                                                                                   + ": butuh minimal 2 baris \"frekuensi,dB\"",
+                                                                                    juce::dontSendNotification);
+                                                              return;
+                                                          }
+
+                                                          microphoneCalibration.setEnabled (true);
+                                                          microphoneCalibration.setModelName (file.getFileNameWithoutExtension());
+
+                                                          if (microphoneCalibration.hasMeasuredSensitivity())
+                                                              statusLabel.setText ("Kurva dimuat: sensitivitas mikrofon "
+                                                                                   + juce::String (microphoneCalibration.getSensitivityDb(), 1)
+                                                                                   + " dB SPL dari file kalibrasi",
+                                                                                    juce::dontSendNotification);
+                                                          else
+                                                              statusLabel.setText ("Kurva dimuat: "
+                                                                                   + juce::String ((int) microphoneCalibration.getCurve().size())
+                                                                                   + " titik dari " + file.getFileName()
+                                                                                   + " (sensitivitas memakai nilai nominal, "
+                                                                                   + "file tidak memuat spesifikasi sensitivitas)",
+                                                                                    juce::dontSendNotification);
+                                                          return;
+
+                                                      });
+                                return;
+                            }
+                            else if (result == 4)
+                            {
+                                microphoneCalibration = MicrophoneCalibration();
+                            }
+                            else
+                            {
+                                return;
+                            }
+
+                            updateCalibrationLabel();
+                        });
+}
+
+juce::File MainComponent::snapshotsDirectory() const
+{
+    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+             .getChildFile ("OpenSmaartLab")
+             .getChildFile ("RTA");
+}
+
+juce::String MainComponent::sanitiseName(const juce::String& name)
+{
+    auto cleaned = name.trim();
+
+    for (const auto character : juce::String ("\\/:*?\"<>|"))
+        cleaned.replace (juce::String (character), "_");
+
+    return cleaned.isEmpty() ? juce::String ("RTA") : cleaned;
+}
+
+void MainComponent::saveSnapshotClicked()
+{
+    if (! isRunning)
+    {
+        statusLabel.setText ("Jalankan pengukuran dulu sebelum menyimpan RTA", juce::dontSendNotification);
+        return;
+    }
+
+    auto* chooser = new juce::FileChooser ("Simpan hasil RTA",
+                                          snapshotsDirectory(),
+                                          "*.rta.csv");
+
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode
+                             | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
+                         [this, chooser] (const juce::FileChooser& fc)
+                         {
+                             auto file = fc.getResult();
+                             delete chooser;
+
+                             if (file == juce::File())
+                                 return;
+
+                             if (! file.hasFileExtension (".csv"))
+                                 file = file.withFileExtension (".rta.csv");
+
+                             file.getParentDirectory().create();
+
+                             if (! fftDisplay.writeSnapshotTo (file))
+                             {
+                                 statusLabel.setText ("Gagal menyimpan RTA ke " + file.getFullPathName(),
+                                                      juce::dontSendNotification);
+                                 return;
+                             }
+
+                             statusLabel.setText ("RTA disimpan: " + file.getFileName(),
+                                                  juce::dontSendNotification);
+                         });
+}
+
+void MainComponent::populateSnapshotMenu()
+{
+    snapshotMenu.clear();
+    snapshotMenu.addItem (1, "Hapus tampilan RTA tersimpan");
+
+    const auto directory = snapshotsDirectory();
+    const auto files = directory.findChildFiles (juce::File::findFiles, false, "*.csv");
+
+    if (files.isEmpty())
+    {
+        snapshotMenu.addItem (2, "(belum ada RTA tersimpan)", false);
+        return;
+    }
+
+    snapshotMenu.addSeparator();
+
+    for (int i = 0; i < files.size(); ++i)
+        snapshotMenu.addItem (10 + i, files[i].getFileName());
+}
+
+void MainComponent::loadSnapshotClicked()
+{
+    populateSnapshotMenu();
+
+    snapshotMenu.showMenuAsync (juce::PopupMenu::Options()
+                                    .withTargetComponent (&loadSnapshotButton),
+                                [this] (int result)
+                                {
+                                    if (result == 1)
+                                    {
+                                        fftDisplay.clearSnapshot();
+                                        statusLabel.setText ("Kembali ke RTA langsung", juce::dontSendNotification);
+                                        return;
+                                    }
+
+                                    if (result < 10)
+                                        return;
+
+                                    const auto files = snapshotsDirectory().findChildFiles (juce::File::findFiles, false, "*.csv");
+                                    const auto index = result - 10;
+
+                                    if (index < 0 || index >= files.size())
+                                        return;
+
+                                    RTASnapshot loaded;
+
+                                    if (! RTASnapshot::readFrom (files[index], loaded))
+                                    {
+                                        statusLabel.setText ("Gagal membaca " + files[index].getFileName(),
+                                                             juce::dontSendNotification);
+                                        return;
+                                    }
+
+                                    fftDisplay.showSnapshot (loaded);
+                                    statusLabel.setText ("Memuat RTA: " + loaded.name
+                                                         + (loaded.calibrationText.isNotEmpty()
+                                                                ? " (" + loaded.calibrationText + ")" : ""),
+                                                         juce::dontSendNotification);
+                                });
+}
+
+void MainComponent::exportCSVClicked()
+{
+    if (!isRunning)
+        return;
+
+    auto* chooser = new juce::FileChooser("Export CSV",
+                                          juce::File::getCurrentWorkingDirectory(),
+                                          "*.csv");
+
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode
+                             | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
+                         [this, chooser] (const juce::FileChooser& fc)
+                         {
+                             const juce::File file = fc.getResult();
+                             delete chooser;
+
+                             if (file == juce::File())
+                                 return;
+
+                             juce::FileOutputStream stream(file);
+
+                             if (!stream.openedOk())
+                                 return;
+
+                             stream.writeText("# OpenSmaartLab - sample rate "
+                                                  + juce::String((int) lastResult.sampleRate)
+                                                  + " Hz, FFT " + juce::String(lastResult.fftSize)
+                                                  + ", averaging " + juce::String(lastResult.averages)
+                                                  + ", delay " + juce::String(lastResult.delayMs, 3)
+                                                  + " ms\n",
+                                              false, false, nullptr);
+
+                             fftDisplay.writeCsv(stream);
+                         });
+}
+
+juce::Rectangle<int> MainComponent::topBarBounds() const
+{
+    return getLocalBounds().withTrimmedTop(8).withHeight(154).reduced(12, 0);
+}
+
+juce::Rectangle<int> MainComponent::statusBarBounds() const
+{
+    return getLocalBounds().removeFromBottom(26).reduced(12, 0);
+}
+
+void MainComponent::paint(juce::Graphics& g)
+{
+    g.fillAll(backgroundColour);
+
+    auto top = topBarBounds();
+    g.setColour(barColour);
+    g.fillRoundedRectangle(top.toFloat(), 6.0f);
+
+    auto status = statusBarBounds();
+    g.setColour(barColour);
+    g.fillRoundedRectangle(status.toFloat(), 4.0f);
+}
+
+void MainComponent::resized()
+{
+    auto area = getLocalBounds();
+    auto status = statusBarBounds();
+    auto top = topBarBounds();
+
+    statusLabel.setBounds(status.removeFromLeft(560));
+    status.removeFromLeft(10);
+    delayLabel.setBounds(status.removeFromLeft(200));
+    status.removeFromLeft(10);
+    coherenceLabel.setBounds(status.removeFromLeft(220));
+
+    auto controls = top.reduced(12, 12);
+
+    auto devices = controls.removeFromTop(42);
+    auto inputArea = devices.removeFromLeft((devices.getWidth() - 16) / 2);
+    devices.removeFromLeft(16);
+    inputLabel.setBounds(inputArea.removeFromLeft(100));
+    inputSelector.setBounds(inputArea.reduced(0, 3));
+    outputLabel.setBounds(devices.removeFromLeft(110));
+    outputSelector.setBounds(devices.reduced(0, 3));
+    calibrationButton.setBounds (controls.removeFromRight (130).reduced (0, 3));
+    controls.removeFromLeft (6);
+    saveSnapshotButton.setBounds (controls.removeFromRight (110).reduced (0, 3));
+    controls.removeFromLeft (6);
+    loadSnapshotButton.setBounds (controls.removeFromRight (100).reduced (0, 3));
+    controls.removeFromLeft (6);
+    auto generatorRow = controls.removeFromBottom(34);
+    pinkNoiseButton.setBounds(generatorRow.removeFromLeft(180));
+    generatorRow.removeFromLeft(12);
+    pinkNoiseLevel.setBounds(generatorRow.removeFromLeft(250));
+    generatorRow.removeFromLeft(12);
+    pinkNoiseHint.setBounds(generatorRow);
+    controls = controls.removeFromTop(36);
+    microphoneChannel.setBounds(controls.removeFromLeft(190));
+    controls.removeFromLeft(8);
+    sampleRateSelector.setBounds(controls.removeFromLeft(100));
+    controls.removeFromLeft(8);
+    bufferSizeSelector.setBounds(controls.removeFromLeft(100));
+    controls.removeFromLeft(8);
+    refreshButton.setBounds(controls.removeFromLeft(90));
+    controls.removeFromLeft(12);
+    fftSizeSelector.setBounds(controls.removeFromLeft(120));
+    controls.removeFromLeft(8);
+    averagingSelector.setBounds(controls.removeFromLeft(90));
+    controls.removeFromLeft(12);
+    startStopButton.setBounds(controls.removeFromLeft(110));
+    controls.removeFromLeft(8);
+    exportButton.setBounds(controls.removeFromLeft(110));
+
+    tabs.setBounds(area.reduced(12, 0).withTrimmedTop(166).withTrimmedBottom(34));
+
+    layoutGenerator();
+}
+
+void MainComponent::componentMovedOrResized(juce::Component& component, bool, bool wasResized)
+{
+    if (&component == &generatorPanel && wasResized)
+        layoutGenerator();
+}
+
+void MainComponent::layoutGenerator()
+{
+    auto area = generatorPanel.getLocalBounds().reduced(20);
+    const auto controlWidth = juce::jlimit(360, 580, area.getWidth() / 2);
+    auto panel = area.removeFromLeft(controlWidth);
+    area.removeFromLeft(20);
+    generatorDisplay.setBounds(area);
+
+    generatorButton.setBounds(panel.removeFromTop(44).removeFromLeft(160));
+
+    generatorInfoLabel.setBounds(panel.removeFromTop(40).reduced(0, 8));
+    panel.removeFromTop(10);
+
+    auto column = panel.removeFromLeft(panel.getWidth() / 2).withTrimmedRight(12);
+
+    generatorTypeLabel.setBounds(column.removeFromTop(24));
+    generatorTypeSelector.setBounds(column.removeFromTop(36));
+    column.removeFromTop(12);
+
+    generatorLevelLabel.setBounds(column.removeFromTop(24));
+    generatorLevelSlider.setBounds(column.removeFromTop(36).reduced(0, 4));
+    column.removeFromTop(12);
+
+    generatorFrequencyLabel.setBounds(column.removeFromTop(24));
+    generatorFrequencySlider.setBounds(column.removeFromTop(36).reduced(0, 4));
+
+    auto sweepColumn = panel;
+
+    generatorSweepStartLabel.setBounds(sweepColumn.removeFromTop(24));
+    generatorSweepStartSlider.setBounds(sweepColumn.removeFromTop(36).reduced(0, 4));
+    sweepColumn.removeFromTop(12);
+
+    generatorSweepEndLabel.setBounds(sweepColumn.removeFromTop(24));
+    generatorSweepEndSlider.setBounds(sweepColumn.removeFromTop(36).reduced(0, 4));
+    sweepColumn.removeFromTop(12);
+
+    generatorSweepDurationLabel.setBounds(sweepColumn.removeFromTop(24));
+    generatorSweepDurationSlider.setBounds(sweepColumn.removeFromTop(36).reduced(0, 4));
+}

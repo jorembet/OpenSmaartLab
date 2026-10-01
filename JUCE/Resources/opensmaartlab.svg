@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b1f27"/>
+      <stop offset="1" stop-color="#0d0f13"/>
+    </linearGradient>
+    <clipPath id="plot">
+      <rect x="26" y="52" width="204" height="150" rx="6"/>
+    </clipPath>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="42" fill="url(#background)"/>
+  <rect x="8" y="8" width="240" height="240" rx="42" fill="none" stroke="#39404f" stroke-width="3"/>
+
+  <g stroke="#232833" stroke-width="2">
+    <line x1="26" y1="127" x2="230" y2="127"/>
+    <line x1="26" y1="165" x2="230" y2="165"/>
+    <line x1="26" y1="89" x2="230" y2="89"/>
+    <line x1="26" y1="51" x2="26" y2="202"/>
+    <line x1="76" y1="51" x2="76" y2="202"/>
+    <line x1="128" y1="51" x2="128" y2="202"/>
+    <line x1="178" y1="51" x2="178" y2="202"/>
+    <line x1="230" y1="51" x2="230" y2="202"/>
+  </g>
+
+  <g clip-path="url(#plot)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M26 186 C48 186 54 150 66 140 C80 128 88 118 102 120 C118 122 124 96 140 88
+             C156 80 164 104 180 112 C196 120 210 96 230 78"
+          stroke="#4fc3f7" stroke-width="9"/>
+    <path d="M26 196 C52 196 62 178 78 166 C96 152 110 168 128 158 C148 147 160 122 178 116
+             C198 109 212 126 230 118"
+          stroke="#9ccc65" stroke-width="7" stroke-opacity="0.85"/>
+    <path d="M26 150 C60 150 84 138 108 140 C134 142 156 134 182 136 C204 138 216 132 230 130"
+          stroke="#ffb74d" stroke-width="6"/>
+  </g>
+
+  <rect x="26" y="52" width="204" height="150" rx="6" fill="none" stroke="#39404f" stroke-width="3"/>
+  <rect x="8" y="8" width="240" height="240" rx="42" fill="none" stroke="#39404f" stroke-width="3"/>
+</svg>

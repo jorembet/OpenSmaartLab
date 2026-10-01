@@ -1,0 +1,25 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# JUCE build output
+JUCE/build/
+JUCE/.cache/
+*.o
+*.a
+
+# Local measurements and calibration downloads
+99-*.csv
+99-*.txt
+*_snapshot*.csv
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+compile_commands.json
