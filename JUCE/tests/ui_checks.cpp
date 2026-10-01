@@ -1,4 +1,5 @@
 #include "MainComponent.h"
+#include "FFTDisplay.h"
 #include "GeneratorDisplay.h"
 #include "TransferFunctionDisplay.h"
 #include "SignalGenerator.h"
@@ -356,6 +357,83 @@ int main()
             "A cleared display must not keep reporting a spectrum from the old signal");
     saveSnapshot(display, png, "/tmp/opensmaart-generator-stopped.png");
 
+    // ---- Spectrogram ----
+    // A scrolling history, so it is checked against data arriving over time: the column
+    // count has to grow, the picture has to be painted, and a range change has to
+    // re-colour it rather than leave the old scale behind.
+    {
+        FFTDisplay spectro;
+        spectro.setBounds(0, 0, 1000, 700);
+        spectro.setStyle(FFTDisplay::Style::Spectrogram);
+
+        require(spectro.getStyle() == FFTDisplay::Style::Spectrogram,
+                "The spectrogram style must be selectable");
+        require(spectro.getSpectrogramColumns() > 0 && spectro.getSpectrogramRows() > 0,
+                "The spectrogram must size itself to the plot");
+
+        const auto columns = spectro.getSpectrogramColumns();
+
+        // A tone that walks up the axis, so the picture has to differ from the cold one.
+        for (int frame = 0; frame < 40; ++frame)
+        {
+            const auto centre = 200.0f * std::pow(2.0f, (float) frame / 12.0f);
+
+            std::vector<float> freq, ref, meas, magnitude, phase, coherence;
+            std::vector<char> valid;
+
+            for (int i = 0; i <= 512; ++i)
+            {
+                const auto f = 20.0f * std::pow(1000.0f, (float) i / 512.0f);
+                const auto near = std::abs(std::log(f / centre)) < 0.2f;
+
+                freq.push_back(f);
+                ref.push_back(-10.0f);
+                meas.push_back(near ? -12.0f : dsp::dbFloor);
+                magnitude.push_back(near ? -2.0f : dsp::dbFloor);
+                phase.push_back(0.0f);
+                coherence.push_back(near ? 0.95f : 0.0f);
+                valid.push_back(near ? 1 : 0);
+            }
+
+            spectro.pushData(freq, ref, meas, magnitude, phase, coherence, valid);
+        }
+
+        require(spectro.getSpectrogramColumns() == columns,
+                "The spectrogram must keep its width as history arrives");
+        require(spectro.getSpectrogramRows() > 0,
+                "The spectrogram must keep its height as history arrives");
+
+        const auto beforeRangeChange = spectro.createComponentSnapshot(spectro.getLocalBounds());
+        require(beforeRangeChange.isValid(), "The spectrogram must paint");
+
+        // Changing the display range has to re-colour the history, not just the scale.
+        spectro.setRange(0.0f, -60.0f);
+        require(spectro.getRangeTop() == 0.0f && spectro.getRangeBottom() == -60.0f,
+                "The display range must be applied exactly as asked");
+        const auto afterRangeChange = spectro.createComponentSnapshot(spectro.getLocalBounds());
+        require(afterRangeChange.isValid(), "The spectrogram must repaint after a range change");
+
+        // A heat map has to produce many distinct colours; a flat fill would mean the
+        // history never reached the picture.
+        std::set<juce::uint32> colours;
+        const auto scan = afterRangeChange.getBounds();
+
+        for (int y = 0; y < scan.getHeight(); y += 3)
+            for (int x = 0; x < scan.getWidth(); x += 3)
+                colours.insert (afterRangeChange.getPixelAt (x, y).getARGB());
+
+        require(colours.size() > 8,
+                "The spectrogram must paint a heat map, not a single flat colour");
+
+        saveSnapshot(spectro, png, "/tmp/opensmaart-spectrogram.png");
+
+        // Back to a bar style the history is dropped, so one view cannot be measured
+        // against the other one's time axis.
+        spectro.setStyle(FFTDisplay::Style::Bands);
+        require(spectro.getSpectrogramColumns() == 0,
+                "Leaving the spectrogram must drop its history");
+    }
+
     std::cout << "PASS: Generator tab has " << visible << " visible controls without resizing; screenshots saved\n";
     std::cout << "PASS: Driver band list picks a driver band, and a hand set band reports manual\n";
     std::cout << "PASS: Measurement, reference and output channels are assigned left and right separately\n";
@@ -402,5 +480,6 @@ int main()
 
     std::cout << "PASS: Generator spectrum renders the configured pink band, tone and sweep range\n";
     std::cout << "PASS: Transfer Function panes draw magnitude, phase and coherence with blanked bins\n";
+    std::cout << "PASS: Spectrogram records level history and follows the display range\n";
     std::cout << "PASS: Generator header reports the tilt of the configured band and the tone frequency\n";
 }

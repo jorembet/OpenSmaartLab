@@ -55,7 +55,8 @@ per-driver generator bands and separate left/right channel assignment.
 
 ### RTA display
 
-- Two styles: octave bands, or 100 evenly spaced bars on a linear frequency axis
+- Three styles: octave bands, 100 evenly spaced bars on a linear frequency axis, or a
+  scrolling spectrogram
 - Band resolution from 1/1 octave up to 1/12 octave
 - Band centres follow the ISO 266 nominal frequency table (20 Hz, 25, 31.5, 40, …)
 - Every band is labelled with its frequency, sized so all 31 labels fit
@@ -65,6 +66,21 @@ per-driver generator bands and separate left/right channel assignment.
 - Per-trace colour picker, remembered between sessions
 - DC offset and sub-audio content are excluded from the lowest band, so a USB
   interface sitting a few millivolts off zero does not read as a loud low band
+
+### Spectrogram
+
+![Spectrogram](docs/spectrogram.png)
+
+- Level history scrolling to the left, one column per frame of live data, so the time
+  axis is real measurement time rather than the refresh rate of the window
+- Log spaced frequency bands, matching the frequency axis of the other views, averaged
+  per band so one loud FFT bin cannot paint a whole band
+- Heat scale with the decibel range printed on it, following the same display range
+  selector as the axes: changing the range recolours the history that is already on
+  screen
+- A band that has not been excited stays cold instead of being drawn as a low band
+- Freeze stops the scroll; leaving the view drops the history, so its time axis cannot
+  silently continue from a moment the user had already left
 
 ### Channel assignment
 

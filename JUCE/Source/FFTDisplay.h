@@ -13,7 +13,7 @@ class FFTDisplay : public juce::Component
 {
 public:
     enum class Mode { SingleChannel = 1, DualChannel, TransferFunction, Coherence, Phase };
-    enum class Style { Bands = 1, BarLinear, Line };
+    enum class Style { Bands = 1, BarLinear, Line, Spectrogram };
 
     struct TraceInfo
     {
@@ -42,11 +42,21 @@ public:
     void setMode(Mode newMode);
     Mode getMode() const { return mode; }
 
+    /** Display range in dB. Shared by the axes and the spectrogram colour scale, so the
+        two cannot drift apart. */
+    void setRange(float top, float bottom);
+    float getRangeTop() const { return topDb; }
+    float getRangeBottom() const { return bottomDb; }
+
     void setOctaveFraction(int fraction);
     int getOctaveFraction() const { return octaveFraction; }
 
     void setStyle(Style newStyle);
     Style getStyle() const { return style; }
+
+    /** Level history, for the spectrogram view. Zero until the first frame arrives. */
+    int getSpectrogramColumns() const { return spectrogramColumns; }
+    int getSpectrogramRows() const { return spectrogramRows; }
 
     void setBandOctaveFraction(int fraction);
     int getBandOctaveFraction() const { return bandOctaveFraction; }
@@ -140,6 +150,21 @@ private:
     void updatePeakHold();
     juce::Rectangle<float> plotArea() const;
     float minimumLabelSpacing(const juce::Rectangle<float>& area) const;
+    /** One history column: the level per log spaced frequency band, as colours.
+
+        The rows are log spaced rather than per FFT bin, so the image is as tall as it is
+        useful and lines up with the log frequency axis of the other views. Averaging
+        rather than taking the peak keeps a single loud bin from painting a whole band.
+    */
+    void pushSpectrogramColumn(const Frame& frame);
+    void resetSpectrogram();
+    void ensureSpectrogramSize();
+    void syncSpectrogramRange() const;
+    void recolourSpectrogram() const;
+    juce::Colour spectrogramColourFor(float db) const;
+    float spectrogramBandLevel(const Frame& frame, int row) const;
+    float rowFrequency(int row) const;
+    void drawSpectrogram(juce::Graphics& g, const juce::Rectangle<float>& area) const;
     float frequencyToX(float freq, const juce::Rectangle<float>& area) const;
     float valueToY(float value, const juce::Rectangle<float>& area) const;
     float frequencyAtX(float x, const juce::Rectangle<float>& area) const;
@@ -219,6 +244,19 @@ private:
     bool levelsValid = false;
     float delayMs = 0.0f;
     float averageCoherence = 0.0f;
+    // The history is kept as two images and swapped, because drawing an image onto
+    // itself is not defined. Both are the size of the plot, so the history is blitted
+    // one to one and no resampling softens the colours.
+    mutable juce::Image spectrogramFront, spectrogramBack;
+    /** The history in decibels, so the picture can be re-coloured when the display range
+        changes without waiting for new data to arrive. */
+    std::vector<float> historyDb;
+    int historyHead = 0;
+    int spectrogramRows = 0;
+    int spectrogramColumns = 0;
+    mutable float spectrogramTopDb = 0.0f;
+    mutable float spectrogramBottomDb = 0.0f;
+
     ChannelLevels measLevels;
     ChannelLevels refLevels;
     juce::String measurementLabel { "Mic" };
