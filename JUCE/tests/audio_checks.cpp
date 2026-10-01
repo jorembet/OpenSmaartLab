@@ -3,6 +3,7 @@
 #include "MicrophoneCalibration.h"
 #include "RTASnapshot.h"
 #include "FrequencyLabels.h"
+#include "SignalGenerator.h"
 #include <cstdlib>
 #include <iostream>
 #include <random>
@@ -685,6 +686,56 @@ int main()
                  "A single transient must lift the peak far above the RMS");
     }
 
+    // ---- Manual generator frequency ----
+    // A typed frequency has to survive unchanged: measurement work needs 997 Hz to
+    // stay 997 Hz, not be rounded to the nearest slider step.
+    {
+        SignalGenerator generator;
+        generator.prepare (rate);
+        generator.setType (SignalGenerator::Type::Sine);
+
+        const auto clamp = [] (float typed)
+        {
+            return juce::jlimit (1.0f, 20000.0f, typed);
+        };
+
+        const std::array<float, 8> typed = { 997.0f, 1000.5f, 20.0f, 63.0f,
+                                             440.0f, 1000.0f, 19999.0f, 20000.0f };
+
+        for (const auto value : typed)
+        {
+            generator.setFrequency (clamp (value));
+            require (std::abs (generator.getFrequency() - clamp (value)) < 0.001f,
+                     "A typed frequency must be applied exactly, not rounded to a slider step");
+
+            // And the generator must actually produce it, not merely store it.
+            std::vector<float> out (size);
+            generator.setRunning (true);
+            generator.process (out.data(), size);
+            generator.setRunning (false);
+
+            dsp::BlockAnalyser analyser;
+            analyser.prepare (rate, size);
+            dsp::Spectrum produced;
+            analyser.analyse (out.data(), produced);
+
+            auto strongest = std::max_element (produced.magnitudeDb.begin(),
+                                               produced.magnitudeDb.end());
+            const auto bin = produced.freq[(size_t) (strongest - produced.magnitudeDb.begin())];
+
+            // One FFT bin at this size is a few Hz, so allow that much slack.
+            require (std::abs (bin - generator.getFrequency())
+                     < std::max (6.0f, generator.getFrequency() * 0.02f),
+                     "The generated signal must sit at the requested frequency");
+        }
+
+        // Out-of-range input must be clamped rather than accepted or wrapped.
+        require (clamp (0.0f) == 1.0f, "A frequency below the floor must clamp");
+        require (clamp (-100.0f) == 1.0f, "A negative frequency must clamp, not wrap");
+        require (clamp (25000.0f) == 20000.0f, "A frequency above the ceiling must clamp");
+        require (clamp (1e9f) == 20000.0f, "An absurd frequency must clamp");
+    }
+
     // ---- Frequency labels must stay legible and not overlap ----
     {
         const auto typeface = FrequencyLabels::font();
@@ -735,6 +786,7 @@ int main()
     std::cout << "PASS: 100-bar linear RTA centres 119.9-19900 Hz, 1500 Hz tone detection, DC rejected\n";
     std::cout << "PASS: frequency labels are bold, sized for the row, and all 31 fit at 1/3 octave\n";
     std::cout << "PASS: RTA RMS/peak figures are 3.01 dB apart on a full-scale sine and hide silence\n";
+    std::cout << "PASS: typed generator frequencies are applied exactly and out-of-range values clamp\n";
     std::cout << "PASS: ISO 266 nominal 1/3 octave table exact; 1/1..1/12 octave counts 11/21/31/41/61/121 strictly increasing\n";
     std::cout << "PASS: bars tile 20 Hz to 20 kHz with no clipping and every centre inside its bar\n";
     std::cout << "PASS: octave bands reject DC offset while keeping the floor level\n";
