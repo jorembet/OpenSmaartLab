@@ -262,6 +262,14 @@ void FFTDisplay::setBarCalibrationFactor(float factor)
     barCalibrationFactor = factor;
 }
 
+void FFTDisplay::setMeasuredLevels(float rmsDb, float peakDb)
+{
+    measuredRmsDb = rmsDb;
+    measuredPeakDb = peakDb;
+    levelsValid = rmsDb > dsp::dbFloor + 1.0f || peakDb > dsp::dbFloor + 1.0f;
+    repaint();
+}
+
 void FFTDisplay::setMicBarColour(const juce::Colour& colour)
 {
     if (micBarColour == colour)
@@ -984,6 +992,19 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
         g.drawText(trace.label, (int) legendX, (int) area.getY() + 6, 70, 18,
                    juce::Justification::centredLeft);
         legendX += 60.0f;
+    }
+
+    // Overall RMS and peak of the measurement channel, shown beside the delay readout.
+    // These are broadband time-domain figures, so they describe the whole mic signal
+    // rather than any single band.
+    if (levelsValid)
+    {
+        const auto levelText = "RMS " + juce::String (measuredRmsDb, 1)
+                             + " dBFS   Peak " + juce::String (measuredPeakDb, 1) + " dBFS";
+
+        g.setColour(mutedColour);
+        g.drawText (levelText, area.getX() - 6.0f, area.getBottom() - 40.0f,
+                    area.getWidth() - 8.0f, 18.0f, juce::Justification::centredRight);
     }
 
     g.setColour(mutedColour);
