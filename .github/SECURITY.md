@@ -21,7 +21,7 @@ Please do not open a public issue for a security problem.
 
 - Affected version or commit
 - Your OS, audio interface, and input/output device
-- Reproduction steps, ideally the smallest set of steps that still shows the problem
+- Reproduction steps, ideally the smallest set that still shows the problem
 - What you expected and what happened instead
 - Impact: what an attacker gains, and what they need in order to gain it
 
@@ -81,5 +81,5 @@ even though they are not classic vulnerabilities:
 
 This is an independent implementation. It is not affiliated with or endorsed by
 Rational Acoustics and contains no third-party Smaart source code, artwork, or
-algorithms. Report security issues for this project to the maintainer listed below,
-not to any third party.
+algorithms. Report security issues for this project to the maintainer, not to any
+third party.
