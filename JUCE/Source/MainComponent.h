@@ -9,6 +9,7 @@
 #include "SPLMeter.h"
 #include "SignalGenerator.h"
 #include "TransferFunction.h"
+#include "TransferFunctionDisplay.h"
 
 class MainComponent : public juce::Component,
                       private juce::Timer,
@@ -20,6 +21,12 @@ public:
 
     void paint(juce::Graphics& g) override;
     void resized() override;
+
+    /** The signal generator, so the checks can confirm the panel controls reach it. */
+    SignalGenerator& getGenerator() { return audioEngine.getGenerator(); }
+
+    /** Which output channel the generator feeds, for the same reason. */
+    AudioEngine::OutputRouting getGeneratorRouting() const { return audioEngine.getGeneratorRouting(); }
 
 private:
     void timerCallback() override;
@@ -41,6 +48,14 @@ private:
     void updateGeneratorBandLowEditor();
     bool isEditingGeneratorFrequency() const;
     void updateGeneratorGeneratorControls();
+    void applyGeneratorBandPreset (int index);
+    void syncGeneratorBandPreset();
+    AudioEngine::OutputRouting currentGeneratorRouting() const;
+    juce::String generatorOutputLabel() const;
+    int measurementChannelIndex() const;
+    int referenceChannelIndex() const;
+    void keepMeasurementAndReferenceDistinct();
+    void resetReferenceTracking();
     void populateSnapshotMenu();
     void chooseSnapshotFile();
     void loadSnapshotFile (const juce::File& file);
@@ -72,7 +87,12 @@ private:
     juce::Label outputLabel { {}, "Output / Putar" };
     juce::ComboBox inputSelector;
     juce::ComboBox outputSelector;
-    juce::ComboBox microphoneChannel;
+    // Measurement and reference are assigned to physical channels on their own, the way
+    // a two channel measurement is actually wired: the microphone on one input and the
+    // loopback tap on the other. Assigning both to the same channel would compare a
+    // signal with itself, so the other selector is moved instead.
+    juce::ComboBox measurementChannelSelector;
+    juce::ComboBox referenceChannelSelector;
     juce::ComboBox sampleRateSelector;
     juce::ComboBox bufferSizeSelector;
     juce::ComboBox fftSizeSelector;
@@ -96,6 +116,11 @@ private:
     FFTDisplay fftDisplay;
     ReverbDisplay reverbDisplay;
     SPLMeter splMeter;
+
+    // A dedicated tab: magnitude, phase and coherence of one dual channel measurement,
+    // with the delay finder that makes coherence usable.
+    TransferFunctionDisplay transferFunctionDisplay;
+    bool findDelayRequested = false;
 
     juce::Component generatorPanel;
     GeneratorDisplay generatorDisplay;
@@ -127,6 +152,14 @@ private:
     juce::TextEditor generatorBandLowEditor;
     juce::Slider generatorBandLowSlider;
     juce::Label generatorBandLowLabel;
+    // One entry per driver, so a band can be picked by name instead of hunting for two
+    // limits. The last entry reports a hand set band rather than pretending to be one.
+    juce::ComboBox generatorBandPresetSelector;
+    juce::Label generatorBandPresetLabel;
+    // Which output channel carries the signal, so the amplifier can be fed from one side
+    // while the other stays silent for the reference tap.
+    juce::ComboBox generatorOutputRoutingSelector;
+    juce::Label generatorOutputRoutingLabel;
     FrequencyEditorListener frequencyEditorListener { *this };
     FrequencyEditorListener bandLowEditorListener { *this };
     bool frequencyEditorActive = false;

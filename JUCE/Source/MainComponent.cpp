@@ -90,19 +90,34 @@ MainComponent::MainComponent()
     updateCalibrationLabel();
     applyCalibrationToSplMeter();
 
-    microphoneChannel.addItem("Mic Ch1 / Ref Ch2", 1);
-    microphoneChannel.addItem("Mic Ch2 / Ref Ch1", 2);
-    microphoneChannel.setSelectedId(1, juce::dontSendNotification);
-    microphoneChannel.setTooltip("RTA memakai kanal Mic. Delay perlu referensi sinyal yang sama di kanal Ref.");
-    microphoneChannel.onChange = [this]
+    // Measurement and reference get their own channel selector, so a microphone on the
+    // left input and a loopback on the right is a normal wiring rather than a swap of a
+    // fixed pair. Both feed the transfer function and the delay reading.
+    // The prefix stays in the item text so the wiring is readable on a toolbar with no
+    // room for separate captions.
+    for (int channel = 0; channel < 2; ++channel)
     {
-        referenceFrames = 0;
-        transferFunction.reset();
-        fftDisplay.clearPeakHold();
-        fftDisplay.setDelayAvailable(false);
-        delayLabel.setText("Delay --", juce::dontSendNotification);
+        measurementChannelSelector.addItem ("Mic: " + AudioEngine::channelName (channel), channel + 1);
+        referenceChannelSelector.addItem ("Ref: " + AudioEngine::channelName (channel), channel + 1);
+    }
+
+    measurementChannelSelector.setSelectedId (1, juce::dontSendNotification);
+    referenceChannelSelector.setSelectedId (2, juce::dontSendNotification);
+    measurementChannelSelector.setTooltip ("Kanal input untuk pengukuran RTA dan transfer function");
+    referenceChannelSelector.setTooltip ("Kanal input untuk sinyal referensi,misal loopback dari output amplifier");
+    measurementChannelSelector.onChange = [this]
+    {
+        keepMeasurementAndReferenceDistinct();
+        resetReferenceTracking();
     };
-    addAndMakeVisible(microphoneChannel);
+    referenceChannelSelector.onChange = [this]
+    {
+        keepMeasurementAndReferenceDistinct();
+        resetReferenceTracking();
+    };
+    addAndMakeVisible(measurementChannelSelector);
+    addAndMakeVisible(referenceChannelSelector);
+    resetReferenceTracking();
     addAndMakeVisible(inputLabel);
     addAndMakeVisible(outputLabel);
     inputSelector.setTitle("Input / Rekam");
@@ -163,9 +178,14 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
         // The slider means a tone frequency for sine, and the upper band limit for
         // pink noise. Following the current type keeps one control useful for both.
         if (generator.getType() == SignalGenerator::Type::Pink)
+        {
             generator.setBandLimits (generator.getBandLow(), value);
+            syncGeneratorBandPreset();
+        }
         else
+        {
             generator.setFrequency (value);
+        }
 
         if (! isEditingGeneratorFrequency())
             generatorFrequencyEditor.setText (juce::String (juce::roundToInt (value)),
@@ -205,6 +225,57 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
         updateGeneratorInfo();
     };
 
+    // A low-band slider for pink noise, so both ends of the band can be set. The
+    // frequency control handles the upper end, so this only covers the lower.
+    // Up to 2 kHz, so the tweeter preset fits: a 2 kHz floor is the highest band edge
+    // any driver band needs, and the slider must be able to show it.
+    generatorBandLowSlider.setRange(10.0, 2000.0, 1.0);
+    generatorBandLowSlider.setSkewFactorFromMidPoint (50.0f);
+    generatorBandLowSlider.setValue (audioEngine.getGenerator().getBandLow(),
+                                     juce::dontSendNotification);
+    generatorBandLowSlider.setTextValueSuffix (" Hz");
+    generatorBandLowSlider.onValueChange = [this]
+    {
+        auto& generator = audioEngine.getGenerator();
+        generator.setBandLimits ((float) generatorBandLowSlider.getValue(), generator.getBandHigh());
+        syncGeneratorBandPreset();
+        updateGeneratorInfo();
+    };
+    generatorBandLowLabel.setText ("Batas bawah pink noise", juce::dontSendNotification);
+    generatorBandLowEditor.setKeyboardType (juce::TextEditor::numericKeyboard);
+    generatorBandLowEditor.setTooltip ("Batas bawah pink noise dalam Hz");
+    generatorBandLowEditor.setTextToShowWhenEmpty ("Hz", mutedColour);
+    generatorBandLowEditor.addListener (&bandLowEditorListener);
+
+    // Band per driver. Correcting a system happens one driver at a time, and coherence
+    // measured across a whole speaker is a blend of a subwoofer and a tweeter, so the
+    // driver bands are picked by name instead of by hunting for two limits.
+    for (int index = 0; index < SignalGenerator::getBandPresets().size(); ++index)
+        generatorBandPresetSelector.addItem (SignalGenerator::getBandPresets()[index].name,
+                                             index + 1);
+    generatorBandPresetSelector.addItem ("Bandingkat manual", 99);
+    generatorBandPresetSelector.setTooltip ("Pilih band driver untuk pink noise");
+    generatorBandPresetSelector.onChange = [this]
+    {
+        applyGeneratorBandPreset (generatorBandPresetSelector.getSelectedId() - 1);
+    };
+    syncGeneratorBandPreset();
+
+    // Output side. A measurement wants the amplifier fed from one output while the other
+    // stays silent, so the reference tap can come from the amplifier output without the
+    // generator arriving straight into the interface input as well.
+    generatorOutputRoutingSelector.addItem ("Kiri + Kanan", 1);
+    generatorOutputRoutingSelector.addItem ("Kiri saja", 2);
+    generatorOutputRoutingSelector.addItem ("Kanan saja", 3);
+    generatorOutputRoutingSelector.setSelectedId (1, juce::dontSendNotification);
+    generatorOutputRoutingSelector.setTooltip ("Kanal output mana yang diberi sinyal generator. "
+                                               "Pilih satu sisi supaya kanal lain bisa dipakai untuk referensi.");
+    generatorOutputRoutingSelector.onChange = [this]
+    {
+        audioEngine.setGeneratorRouting (currentGeneratorRouting());
+        updateGeneratorInfo();
+    };
+
     auto makeLabel = [this] (juce::Label& label, const juce::String& text)
     {
         label.setText(text, juce::dontSendNotification);
@@ -215,6 +286,8 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     };
 
     makeLabel(generatorTypeLabel, "Jenis Sinyal");
+    makeLabel(generatorBandPresetLabel, "Band Driver");
+    makeLabel(generatorOutputRoutingLabel, "Output Kanal");
     makeLabel(generatorLevelLabel, "Level");
     makeLabel(generatorFrequencyLabel, "Frekuensi");
     makeLabel(generatorSweepStartLabel, "Sweep Mulai");
@@ -233,6 +306,8 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     generatorPanel.addAndMakeVisible(generatorLevelSlider);
     generatorPanel.addAndMakeVisible(generatorFrequencySlider);
     generatorPanel.addAndMakeVisible(generatorFrequencyEditor);
+    generatorPanel.addAndMakeVisible(generatorBandPresetSelector);
+    generatorPanel.addAndMakeVisible(generatorOutputRoutingSelector);
     generatorPanel.addAndMakeVisible(generatorBandLowLabel);
     generatorPanel.addAndMakeVisible(generatorBandLowSlider);
     generatorPanel.addAndMakeVisible(generatorBandLowEditor);
@@ -240,6 +315,8 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     generatorPanel.addAndMakeVisible(generatorSweepEndSlider);
     generatorPanel.addAndMakeVisible(generatorSweepDurationSlider);
     generatorPanel.addAndMakeVisible(generatorTypeLabel);
+    generatorPanel.addAndMakeVisible(generatorBandPresetLabel);
+    generatorPanel.addAndMakeVisible(generatorOutputRoutingLabel);
     generatorPanel.addAndMakeVisible(generatorLevelLabel);
     generatorPanel.addAndMakeVisible(generatorFrequencyLabel);
     generatorPanel.addAndMakeVisible(generatorSweepStartLabel);
@@ -252,6 +329,8 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     generatorPanel.addComponentListener(this);
     addAndMakeVisible(tabs);
     tabs.addTab("RTA / Delay", backgroundColour, &fftDisplay, false);
+    tabs.addTab("Transfer Function", backgroundColour, &transferFunctionDisplay, false);
+    transferFunctionDisplay.onFindDelay = [this] { findDelayRequested = true; };
     tabs.addTab("Reverberation", backgroundColour, &reverbDisplay, false);
     tabs.addTab("SPL Meter", backgroundColour, &splMeter, false);
     tabs.addTab("Generator", backgroundColour, &generatorPanel, false);
@@ -512,24 +591,6 @@ void MainComponent::playPinkNoise()
     }
     generatorTypeSelector.setSelectedId(1, juce::sendNotificationSync);
 
-    // A low-band slider for pink noise, so both ends of the band can be set. The
-    // frequency control handles the upper end, so this only covers the lower.
-    generatorBandLowSlider.setRange(10.0, 500.0, 1.0);
-    generatorBandLowSlider.setSkewFactorFromMidPoint (50.0f);
-    generatorBandLowSlider.setValue (audioEngine.getGenerator().getBandLow(),
-                                     juce::dontSendNotification);
-    generatorBandLowSlider.setTextValueSuffix (" Hz");
-    generatorBandLowSlider.onValueChange = [this]
-    {
-        auto& generator = audioEngine.getGenerator();
-        generator.setBandLimits ((float) generatorBandLowSlider.getValue(), generator.getBandHigh());
-        updateGeneratorInfo();
-    };
-    generatorBandLowLabel.setText ("Batas bawah pink noise", juce::dontSendNotification);
-    generatorBandLowEditor.setKeyboardType (juce::TextEditor::numericKeyboard);
-    generatorBandLowEditor.setTooltip ("Batas bawah pink noise dalam Hz");
-    generatorBandLowEditor.setTextToShowWhenEmpty ("Hz", mutedColour);
-    generatorBandLowEditor.addListener (&bandLowEditorListener);
     if (!isRunning)
         startStopClicked();
     if (isRunning)
@@ -547,6 +608,7 @@ void MainComponent::generatorToggled()
         generatorOn = false;
         audioEngine.getGenerator().setRunning(false);
         generatorDisplay.setRunning(false);
+        generatorDisplay.clear();
         generatorInfoLabel.setColour(juce::Label::textColourId, stoppedColour);
         generatorInfoLabel.setText("Audio belum berjalan - tekan Mulai dulu sebelum menyalakan generator",
                                   juce::dontSendNotification);
@@ -587,16 +649,30 @@ void MainComponent::generatorToggled()
 void MainComponent::updateGeneratorInfo()
 {
     auto& generator = audioEngine.getGenerator();
+
+    // The display has to follow the settings even while stopped, otherwise the axis and
+    // band shading keep describing the previous configuration.
+    generatorDisplay.setSignal(generatorTypeSelector.getText(), (float) generatorLevelSlider.getValue(),
+                               generator.getSweepProgress(), generatorOutputLabel());
+    generatorDisplay.setGeneratorSettings(generator.getBandLow(), generator.getBandHigh(),
+                                          generator.getFrequency(),
+                                          generator.getSweepStart(), generator.getSweepEnd());
+
     pinkNoiseButton.setButtonText(generatorOn ? "Stop Generator" : "Play Pink Noise");
     pinkNoiseButton.setColour(juce::TextButton::buttonColourId, generatorOn ? runningColour : barColour);
     fftDisplay.showGeneratorReference(generatorOn);
 
     if (!generatorOn)
     {
+        generatorDisplay.clear();
         generatorInfoLabel.setColour(juce::Label::textColourId, mutedColour);
         generatorInfoLabel.setText("Generator mati", juce::dontSendNotification);
         return;
     }
+
+    // While running, refresh the plot at once so a slider change is visible before the
+    // next captured block arrives.
+    updateGeneratorDisplay();
 
     generatorInfoLabel.setColour(juce::Label::textColourId, runningColour);
     generatorInfoLabel.setText("Generator aktif - " + generatorTypeSelector.getText()
@@ -611,11 +687,11 @@ void MainComponent::updateGeneratorDisplay()
     std::vector<float> output;
     audioEngine.getGeneratorOutput(output);
 
-    const auto outputName = outputSelector.getSelectedId() > 1
-                          ? outputSelector.getText() : juce::String("-");
-
     generatorDisplay.setSignal(generatorTypeSelector.getText(), (float) generatorLevelSlider.getValue(),
-                               generator.getSweepProgress(), outputName);
+                               generator.getSweepProgress(), generatorOutputLabel());
+    generatorDisplay.setGeneratorSettings(generator.getBandLow(), generator.getBandHigh(),
+                                          generator.getFrequency(),
+                                          generator.getSweepStart(), generator.getSweepEnd());
     generatorDisplay.setSamples(output, (float) audioEngine.getSampleRate());
 }
 
@@ -641,23 +717,28 @@ void MainComponent::timerCallback()
     std::vector<float> ref;
     std::vector<float> meas;
 
-    std::vector<float> generated;
-    audioEngine.getLatestBlock(generatorOn ? 65536 : transferFunction.getFftSize(), ref, meas, &generated);
+    std::vector<float> left;
+    std::vector<float> right;
 
-    if (ref.size() < (size_t) transferFunction.getFftSize() || meas.size() < (size_t) transferFunction.getFftSize())
+    std::vector<float> generated;
+    audioEngine.getLatestBlock(generatorOn ? 65536 : transferFunction.getFftSize(), left, right, &generated);
+
+    if (left.size() < (size_t) transferFunction.getFftSize()
+        || right.size() < (size_t) transferFunction.getFftSize())
         return;
 
     const auto channels = audioEngine.getCapturedChannels();
     if (channels == 0)
         return;
-    if (channels == 1)
-    {
-        // A mono microphone always supplies the measurement channel.
-        meas = ref;
-        std::fill(ref.begin(), ref.end(), 0.0f);
-    }
-    else if (microphoneChannel.getSelectedId() == 1)
-        std::swap(ref, meas);
+
+    // The engine hands the channels back in physical order, so the measurement is picked
+    // out by its assignment. Both outputs have to come back the same length: downstream
+    // code walks them together, and an empty one would read past the end of the other.
+    dsp::assignMeasurementAndReference(measurementChannelIndex(), left, right, meas, ref);
+
+    if (ref.size() < (size_t) transferFunction.getFftSize()
+        || meas.size() != ref.size())
+        return;
 
     const auto generatorType = audioEngine.getGenerator().getType();
     const bool broadbandGenerator = generatorOn && (generatorType == SignalGenerator::Type::Pink
@@ -714,6 +795,14 @@ void MainComponent::timerCallback()
 
     splMeter.process(ref.data(), meas.data(), (int) ref.size());
 
+    // The delay search needs the raw pair, so the button sets a flag and the frame that
+    // follows does the work with fresh data.
+    if (findDelayRequested)
+    {
+        findDelayRequested = false;
+        transferFunction.findDelay(ref.data(), meas.data());
+    }
+
     auto result = transferFunction.process(ref.data(), meas.data(), (int) ref.size());
 
     if (!result.valid)
@@ -741,7 +830,10 @@ void MainComponent::timerCallback()
     fftDisplay.setDelayMs(result.delayMs);
     fftDisplay.setAverageCoherence(result.averageCoherence);
     fftDisplay.pushData(result.freq, result.refMagnitudeDb, result.measMagnitudeDb,
-                        result.magnitudeDb, result.phaseDeg, result.coherence);
+                        result.magnitudeDb, result.phaseDeg, result.coherence, result.binValid);
+
+    if (transferFunctionDisplay.isVisible())
+        transferFunctionDisplay.pushData(result);
 
     delayLabel.setText(delayAvailable ? (generatorOn ? "Total " : "Delay ") + juce::String(result.delayMs, 3) + " ms"
                                     : (generatorOn ? "Total -- (menunggu mic)" : "Delay -- (perlu referensi)"),
@@ -1230,7 +1322,9 @@ void MainComponent::resized()
     generatorRow.removeFromLeft(12);
     pinkNoiseHint.setBounds(generatorRow);
     controls = controls.removeFromTop(36);
-    microphoneChannel.setBounds(controls.removeFromLeft(190));
+    measurementChannelSelector.setBounds(controls.removeFromLeft(140));
+    controls.removeFromLeft(8);
+    referenceChannelSelector.setBounds(controls.removeFromLeft(140));
     controls.removeFromLeft(8);
     sampleRateSelector.setBounds(controls.removeFromLeft(100));
     controls.removeFromLeft(8);
@@ -1316,6 +1410,7 @@ void MainComponent::applyTypedBandLow()
     generator.setBandLimits (clamped, generator.getBandHigh());
     generatorBandLowSlider.setValue ((double) generator.getBandLow(), juce::dontSendNotification);
     updateGeneratorBandLowEditor();
+    syncGeneratorBandPreset();
     updateGeneratorInfo();
 
     statusLabel.setText ("Pink noise: " + juce::String (generator.getBandLow(), 1)
@@ -1379,9 +1474,14 @@ void MainComponent::applyTypedFrequency()
     const auto clamped = juce::jlimit (low, high, parsed);
 
     if (pink)
+    {
         generator.setBandLimits (generator.getBandLow(), clamped);
+        syncGeneratorBandPreset();
+    }
     else
+    {
         generator.setFrequency (clamped);
+    }
 
     generatorFrequencySlider.setValue ((double) clamped, juce::dontSendNotification);
     updateGeneratorFrequencyEditor();
@@ -1410,6 +1510,102 @@ void MainComponent::updateGeneratorFrequencyEditor()
                                       juce::dontSendNotification);
 }
 
+void MainComponent::applyGeneratorBandPreset(int index)
+{
+    const auto presets = SignalGenerator::getBandPresets();
+
+    if (index < 0 || index >= presets.size())
+        return;
+
+    const auto& preset = presets[index];
+    auto& generator = audioEngine.getGenerator();
+
+    generator.setBandLimits (preset.lowFrequency, preset.highFrequency);
+
+    // Sliders and boxes follow without firing their own callbacks, or each would push
+    // its own value back into the generator while the other two are still stale.
+    generatorBandLowSlider.setValue ((double) generator.getBandLow(), juce::dontSendNotification);
+    generatorFrequencySlider.setValue ((double) generator.getBandHigh(), juce::dontSendNotification);
+    updateGeneratorBandLowEditor();
+    updateGeneratorFrequencyEditor();
+
+    statusLabel.setText ("Pink noise band " + preset.name, juce::dontSendNotification);
+    updateGeneratorInfo();
+}
+
+int MainComponent::measurementChannelIndex() const
+{
+    return juce::jlimit (0, 1, measurementChannelSelector.getSelectedId() - 1);
+}
+
+int MainComponent::referenceChannelIndex() const
+{
+    return juce::jlimit (0, 1, referenceChannelSelector.getSelectedId() - 1);
+}
+
+void MainComponent::keepMeasurementAndReferenceDistinct()
+{
+    const auto measurement = measurementChannelIndex();
+
+    // Comparing a channel with itself would report a flat, meaningless transfer
+    // function, so the reference moves to the other input instead.
+    if (referenceChannelIndex() != measurement)
+        return;
+
+    referenceChannelSelector.setSelectedId (measurement == 0 ? 2 : 1, juce::dontSendNotification);
+    statusLabel.setText ("Pengukuran dan referensi harus memakai kanal berbeda, referensi dipindah ke "
+                         + AudioEngine::channelName (measurement == 0 ? 1 : 0),
+                         juce::dontSendNotification);
+}
+
+void MainComponent::resetReferenceTracking()
+{
+    // A different reference channel means the old averages describe the old wiring.
+    referenceFrames = 0;
+    transferFunction.reset();
+    fftDisplay.clearPeakHold();
+    fftDisplay.setDelayAvailable(false);
+    fftDisplay.setChannelLabels (AudioEngine::channelName (measurementChannelIndex()),
+                                 AudioEngine::channelName (referenceChannelIndex()));
+    delayLabel.setText ("Delay --", juce::dontSendNotification);
+}
+
+juce::String MainComponent::generatorOutputLabel() const
+{
+    if (outputSelector.getSelectedId() <= 1)
+        return juce::String("-");
+
+    const auto device = outputSelector.getText();
+    const auto side = currentGeneratorRouting() == AudioEngine::OutputRouting::Left ? " (kiri)"
+                    : currentGeneratorRouting() == AudioEngine::OutputRouting::Right ? " (kanan)"
+                                                                                    : juce::String();
+
+    return device + side;
+}
+
+AudioEngine::OutputRouting MainComponent::currentGeneratorRouting() const
+{
+    switch (generatorOutputRoutingSelector.getSelectedId())
+    {
+        case 2:  return AudioEngine::OutputRouting::Left;
+        case 3:  return AudioEngine::OutputRouting::Right;
+        default: return AudioEngine::OutputRouting::Both;
+    }
+}
+
+void MainComponent::syncGeneratorBandPreset()
+{
+    const auto& generator = audioEngine.getGenerator();
+    const auto presets = SignalGenerator::getBandPresets();
+    const auto index = SignalGenerator::findBandPreset (generator.getBandLow(),
+                                                        generator.getBandHigh());
+
+    // A hand set band reports itself as such, so the list never claims a driver band
+    // the signal does not actually match.
+    generatorBandPresetSelector.setSelectedId (index >= 0 ? index + 1 : 99,
+                                               juce::dontSendNotification);
+}
+
 void MainComponent::updateGeneratorGeneratorControls()
 {
     const auto type = audioEngine.getGenerator().getType();
@@ -1436,6 +1632,9 @@ void MainComponent::updateGeneratorGeneratorControls()
     generatorBandLowSlider.setEnabled (pink);
     generatorBandLowEditor.setEnabled (pink);
     generatorBandLowEditor.setAlpha (pink ? 1.0f : 0.4f);
+    generatorBandPresetLabel.setEnabled (pink);
+    generatorBandPresetSelector.setEnabled (pink);
+    generatorBandPresetSelector.setAlpha (pink ? 1.0f : 0.4f);
     generatorFrequencySlider.setEnabled (live);
     generatorFrequencyEditor.setEnabled (live);
     generatorFrequencyEditor.setAlpha (live ? 1.0f : 0.4f);
@@ -1456,6 +1655,7 @@ void MainComponent::updateGeneratorGeneratorControls()
         generatorBandLowSlider.setValue ((double) generator.getBandLow(),
                                          juce::dontSendNotification);
         updateGeneratorBandLowEditor();
+        syncGeneratorBandPreset();
     }
 
     updateGeneratorFrequencyEditor();
@@ -1482,6 +1682,14 @@ void MainComponent::layoutGenerator()
 
     generatorLevelLabel.setBounds(column.removeFromTop(24));
     generatorLevelSlider.setBounds(column.removeFromTop(36).reduced(0, 4));
+    column.removeFromTop(12);
+
+    generatorBandPresetLabel.setBounds(column.removeFromTop(24));
+    generatorBandPresetSelector.setBounds(column.removeFromTop(36));
+    column.removeFromTop(12);
+
+    generatorOutputRoutingLabel.setBounds(column.removeFromTop(24));
+    generatorOutputRoutingSelector.setBounds(column.removeFromTop(36));
     column.removeFromTop(12);
 
     generatorFrequencyLabel.setBounds(column.removeFromTop(24));

@@ -72,6 +72,33 @@ void SignalGenerator::setFrequency(float newFrequency)
     frequency = juce::jlimit(1.0f, (float) (sampleRate * 0.5 - 1.0), newFrequency);
 }
 
+juce::Array<SignalGenerator::BandPreset> SignalGenerator::getBandPresets()
+{
+    // Edges follow common driver divisions: subwoofer below the first woofer octave,
+    // woofer to the lower midrange, midrange up to the presence region, and everything
+    // above for the tweeter. The boundaries are also where the slope reading stays
+    // meaningful, because each band spans at least two octaves.
+    juce::Array<BandPreset> presets;
+    presets.add ({ "Subwoofer  20 - 100 Hz", 20.0f, 100.0f });
+    presets.add ({ "Woofer  100 - 500 Hz", 100.0f, 500.0f });
+    presets.add ({ "Midrange  500 - 2000 Hz", 500.0f, 2000.0f });
+    presets.add ({ "Tweeter  2000 - 20000 Hz", 2000.0f, 20000.0f });
+    presets.add ({ "Full  20 - 20000 Hz", 20.0f, 20000.0f });
+    return presets;
+}
+
+int SignalGenerator::findBandPreset(float lowFrequency, float highFrequency)
+{
+    const auto presets = getBandPresets();
+
+    for (int i = 0; i < presets.size(); ++i)
+        if (std::abs (presets[i].lowFrequency - lowFrequency) < 0.5f
+            && std::abs (presets[i].highFrequency - highFrequency) < 0.5f)
+            return i;
+
+    return -1;
+}
+
 void SignalGenerator::setBandLimits(float lowFrequency, float highFrequency)
 {
     const auto low = juce::jlimit (10.0f, 2000.0f, lowFrequency);

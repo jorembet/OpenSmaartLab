@@ -52,6 +52,31 @@ void TransferFunction::setAutomaticDelay(bool shouldTrack, float newMaxLagMs)
     maxLagMs = juce::jlimit(1.0f, 2000.0f, newMaxLagMs);
 }
 
+void TransferFunction::setBlankingRangeDb(float rangeDb)
+{
+    blankingRangeDb = juce::jlimit(10.0f, 120.0f, rangeDb);
+}
+
+float TransferFunction::findDelay(const float* ref, const float* meas)
+{
+    if (ref == nullptr || meas == nullptr)
+        return delaySamples;
+
+    // The search cannot reach past half the analysed block, so a larger request would
+    // quietly look for less than the user asked for.
+    const auto reachableMs = 1000.0f * (float) (analyser.getFftSize() / 2) / sampleRate;
+    delaySamples = delayFinder.analyse(ref, meas, sampleRate, std::min(maxLagMs, reachableMs));
+    delayMs = delaySamples / sampleRate * 1000.0f;
+
+    // Every frame averaged so far was compensated with a different delay, so the averages
+    // start again and the whole measurement shares one compensation.
+    averagedRefPower.clear();
+    averagedMeasPower.clear();
+    averagedCross.clear();
+
+    return delaySamples;
+}
+
 void TransferFunction::setManualDelay(float newDelaySamples)
 {
     delaySamples = newDelaySamples;
@@ -99,8 +124,7 @@ TransferFunction::Result TransferFunction::process(const float* ref,
         && ((automaticDelayEnabled && (frameCounter % 8) == 0)
             || (!automaticDelayEnabled && frameCounter == 0)))
     {
-        delaySamples = delayFinder.analyse(ref, meas, sampleRate, maxLagMs);
-        delayMs = delaySamples / sampleRate * 1000.0f;
+        findDelay(ref, meas);
     }
 
     const auto previousWeight = firstFrame ? 0.0f : smoothingAlpha;
@@ -118,6 +142,7 @@ TransferFunction::Result TransferFunction::process(const float* ref,
 
     initialised = true;
     ++frameCounter;
+    ++delaySearchFrames;
 
     const auto binRotation = 2.0f * dsp::pi * delaySamples / (float) fftSize;
 
@@ -128,36 +153,71 @@ TransferFunction::Result TransferFunction::process(const float* ref,
     result.refMagnitudeDb = refSpectrum.magnitudeDb;
     result.measMagnitudeDb = measSpectrum.magnitudeDb;
 
-    double coherenceSum = 0.0;
-    int coherenceCount = 0;
+    // Bins whose reference sits far below the strongest bin carry no measurement. Their
+    // coherence would be the ratio of two near-zero powers, which reads as a confident
+    // 1.0 and their magnitude as a huge gain, so they are blanked rather than divided.
+    auto peakReferencePower = 0.0f;
+
+    for (size_t i = 1; i < bins; ++i)
+        peakReferencePower = std::max(peakReferencePower, averagedRefPower[i]);
+
+    const auto blankingPower = peakReferencePower * std::pow (10.0f, -blankingRangeDb / 10.0f);
+
+    result.binValid.resize(bins);
+    result.peakReferenceDb = 10.0f * std::log10 (std::max(peakReferencePower, 1.0e-30f));
+
+    double coherenceWeighted = 0.0;
+    double coherenceWeight = 0.0;
+    auto coherenceCount = 0;
 
     for (size_t i = 0; i < bins; ++i)
     {
+        const auto refPower = averagedRefPower[i];
+        const auto measurable = i > 0 && refPower > blankingPower && refPower > 1.0e-30f;
+
+        if (! measurable)
+        {
+            result.binValid[i] = 0;
+            result.magnitudeDb[i] = dsp::dbFloor;
+            result.phaseDeg[i] = 0.0f;
+            result.coherence[i] = 0.0f;
+            ++result.blankedBins;
+            continue;
+        }
+
         const auto compensated = delayCompensationEnabled
                                ? averagedCross[i] * std::exp(dsp::Complex(0.0f, binRotation * (float) i))
                                : averagedCross[i];
 
-        const auto refPower = std::max(averagedRefPower[i], 1.0e-30f);
         const auto measPower = std::max(averagedMeasPower[i], 1.0e-30f);
 
-        const auto magnitude = std::abs(compensated) / refPower;
-        const auto phase = std::atan2(compensated.imag(), compensated.real()) * dsp::radToDeg;
-        const auto coherence = std::min(1.0f, std::norm(compensated) / (refPower * measPower));
+        result.binValid[i] = 1;
+        result.magnitudeDb[i] = dsp::db20 (std::abs (compensated) / refPower);
+        result.phaseDeg[i] = std::atan2 (compensated.imag(), compensated.real()) * dsp::radToDeg;
+        result.coherence[i] = juce::jlimit (0.0f, 1.0f, std::norm (compensated) / (refPower * measPower));
+        ++result.validBins;
 
-        result.magnitudeDb[i] = dsp::db20(magnitude);
-        result.phaseDeg[i] = phase;
-        result.coherence[i] = coherence;
-
+        // The average is weighted by reference power: a flat mean would count a 20 Hz wide
+        // bin at the bottom the same as a wide one at the top and hide where the
+        // measurement actually holds.
         if (refSpectrum.freq[i] >= 100.0f)
         {
-            coherenceSum += coherence;
+            coherenceWeighted += (double) result.coherence[i] * (double) refPower;
+            coherenceWeight += (double) refPower;
             ++coherenceCount;
         }
     }
 
     dsp::unwrapPhase(result.magnitudeDb, result.phaseDeg);
 
-    result.averageCoherence = coherenceCount > 0 ? (float) (coherenceSum / coherenceCount) : 0.0f;
+    result.averageCoherence = coherenceWeight > 0.0
+                            ? (float) (coherenceWeighted / coherenceWeight)
+                            : 0.0f;
+
+    // No measurable bin at all means the reference is silent, which must not be reported
+    // as a perfect measurement.
+    if (result.validBins == 0 || coherenceCount == 0)
+        result.averageCoherence = 0.0f;
     result.delaySamples = delaySamples;
     result.delayMs = delayMs;
 

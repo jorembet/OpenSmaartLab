@@ -154,6 +154,14 @@ FFTDisplay::FFTDisplay()
     addAndMakeVisible(outputColourButton);
 }
 
+void FFTDisplay::setChannelLabels(const juce::String& measurement, const juce::String& reference)
+{
+    measurementLabel = measurement.isNotEmpty() ? measurement : juce::String("Mic");
+    referenceLabel = reference.isNotEmpty() ? reference : juce::String("Ref");
+    displayDirty = true;
+    repaint();
+}
+
 void FFTDisplay::ColourSwatchButton::setColour(const juce::Colour& newColour)
 {
     colour = newColour;
@@ -414,7 +422,8 @@ void FFTDisplay::pushData(const std::vector<float>& freq,
                           const std::vector<float>& measMagnitudeDb,
                           const std::vector<float>& tfMagnitudeDb,
                           const std::vector<float>& tfPhaseDeg,
-                          const std::vector<float>& coherence)
+                          const std::vector<float>& coherence,
+                          const std::vector<char>& binValid)
 {
     if (frozen)
         return;
@@ -427,6 +436,7 @@ void FFTDisplay::pushData(const std::vector<float>& freq,
     current.tfDb = tfMagnitudeDb;
     current.tfPhase = tfPhaseDeg;
     current.coherence = coherence;
+    current.binValid = binValid;
     current.valid = !freq.empty();
 
     // Only the microphone channel is calibrated. The reference channel is usually a
@@ -452,6 +462,7 @@ void FFTDisplay::rebuildDisplay()
         return;
 
     display.freq = frame.freq;
+    display.binValid = frame.binValid;
     display.traces.clear();
     display.valid = frame.valid && !frame.freq.empty();
 
@@ -488,7 +499,8 @@ void FFTDisplay::rebuildDisplay()
             }
             else
                 dsp::smoothMagnitudeDb(frame.freq, frame.measDb, octaveFraction, smoothed.emplace_back());
-            display.traces.push_back({ &smoothed.back(), barStyle ? micBarColour : channelOneColour, "Mic" });
+            display.traces.push_back({ &smoothed.back(), barStyle ? micBarColour : channelOneColour,
+                                       measurementLabel });
             if (generatorReference)
             {
                 if (barStyle)
@@ -505,8 +517,8 @@ void FFTDisplay::rebuildDisplay()
         {
             dsp::smoothMagnitudeDb(frame.freq, frame.refDb, octaveFraction, smoothed.emplace_back());
             dsp::smoothMagnitudeDb(frame.freq, frame.measDb, octaveFraction, smoothed.emplace_back());
-            display.traces.push_back({ &smoothed[0], channelOneColour, "Ref" });
-            display.traces.push_back({ &smoothed[1], channelTwoColour, "Mic" });
+            display.traces.push_back({ &smoothed[0], channelOneColour, referenceLabel });
+            display.traces.push_back({ &smoothed[1], channelTwoColour, measurementLabel });
             display.axis = Axis::Decibels;
             break;
         }
@@ -979,6 +991,7 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
             continue;
         }
         juce::Path path;
+        auto started = false;
 
         for (size_t i = 0; i < display.freq.size(); ++i)
         {
@@ -987,13 +1000,23 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
             if (freq < minFrequency || freq > maxFrequency)
                 continue;
 
+            // A bin the reference never excited carries no transfer function, so the line
+            // breaks there instead of drawing a run of zeros as if it were measured.
+            if (!display.binValid.empty() && display.binValid[i] == 0)
+            {
+                started = false;
+                continue;
+            }
+
             const auto x = frequencyToX(freq, area);
             const auto y = valueToY((*trace.values)[i], area);
 
-            if (path.isEmpty())
-                path.startNewSubPath(x, y);
-            else
+            if (started)
                 path.lineTo(x, y);
+            else
+                path.startNewSubPath(x, y);
+
+            started = true;
         }
 
         g.setColour(trace.colour);
@@ -1039,20 +1062,22 @@ void FFTDisplay::drawLevelReadout(juce::Graphics& g, const juce::Rectangle<float
     if (levelsValid && aboveFloor (measLevels))
     {
         g.setColour (traceColourFor (0));
-        g.drawText ("Mic", area.getX() + 10.0f, y, 40.0f, 18.0f, juce::Justification::centredLeft);
+        g.drawText (measurementLabel, area.getX() + 10.0f, y, 110.0f, 18.0f,
+                    juce::Justification::centredLeft);
         g.setColour (mutedColour);
-        g.drawText ("RMS " + line (measLevels), area.getX() + 52.0f, y,
-                    area.getWidth() - 70.0f, 18.0f, juce::Justification::centredRight);
+        g.drawText ("RMS " + line (measLevels), area.getX() + 124.0f, y,
+                    area.getWidth() - 140.0f, 18.0f, juce::Justification::centredRight);
         y += 19.0f;
     }
 
     if (generatorReference && aboveFloor (refLevels))
     {
         g.setColour (traceColourFor (1));
-        g.drawText ("Output", area.getX() + 10.0f, y, 46.0f, 18.0f, juce::Justification::centredLeft);
+        g.drawText (referenceLabel, area.getX() + 10.0f, y, 110.0f, 18.0f,
+                    juce::Justification::centredLeft);
         g.setColour (mutedColour);
-        g.drawText ("RMS " + line (refLevels), area.getX() + 58.0f, y,
-                    area.getWidth() - 70.0f, 18.0f, juce::Justification::centredRight);
+        g.drawText ("RMS " + line (refLevels), area.getX() + 124.0f, y,
+                    area.getWidth() - 140.0f, 18.0f, juce::Justification::centredRight);
     }
 
     // The delay line stays where it was, just above the plot edge.

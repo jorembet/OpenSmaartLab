@@ -36,7 +36,8 @@ public:
                   const std::vector<float>& measMagnitudeDb,
                   const std::vector<float>& tfMagnitudeDb,
                   const std::vector<float>& tfPhaseDeg,
-                  const std::vector<float>& coherence);
+                  const std::vector<float>& coherence,
+                  const std::vector<char>& binValid = {});
 
     void setMode(Mode newMode);
     Mode getMode() const { return mode; }
@@ -83,6 +84,10 @@ public:
 
     void setMeasuredLevels(float rmsDb, float peakDb);
     void setReferenceLevels(float rmsDb, float peakDb);
+
+    /** Names the two input channels the way the toolbar assigns them, so the plot says
+        which physical channel carries the measurement and which the reference. */
+    void setChannelLabels(const juce::String& measurement, const juce::String& reference);
     ChannelLevels getMeasuredLevels() const { return measLevels; }
     ChannelLevels getReferenceLevels() const { return refLevels; }
     void setRunning(bool isNowRunning);
@@ -114,6 +119,9 @@ private:
         std::vector<float> tfDb;
         std::vector<float> tfPhase;
         std::vector<float> coherence;
+        /** One entry per bin: false where the reference carries no signal, so its
+            coherence is a ratio of two near-zero powers and must not be drawn. */
+        std::vector<char> binValid;
         bool valid = false;
     };
 
@@ -121,6 +129,9 @@ private:
     {
         std::vector<float> freq;
         std::vector<TraceInfo> traces;
+        /** Carried over from the frame so a line breaks where the reference was silent
+            instead of drawing a flat run of meaningless zeros. */
+        std::vector<char> binValid;
         Axis axis = Axis::Decibels;
         bool valid = false;
     };
@@ -210,6 +221,8 @@ private:
     float averageCoherence = 0.0f;
     ChannelLevels measLevels;
     ChannelLevels refLevels;
+    juce::String measurementLabel { "Mic" };
+    juce::String referenceLabel { "Ref" };
 
     MicrophoneCalibration calibration;
     float barCalibrationFactor = 0.0f;

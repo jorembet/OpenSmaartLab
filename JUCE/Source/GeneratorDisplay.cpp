@@ -13,10 +13,9 @@ namespace
     const juce::Colour spectrumColour = juce::Colour(0xffffb74d);
     const juce::Colour runningColour = juce::Colour(0xff43a047);
     const juce::Colour stoppedColour = juce::Colour(0xffe53935);
+    const juce::Colour bandShadeColour = juce::Colour(0xff262c3a);
 
     constexpr int analysisSize = 4096;
-    constexpr float minFrequency = 20.0f;
-    constexpr float maxFrequency = 20000.0f;
 }
 
 GeneratorDisplay::GeneratorDisplay()
@@ -56,6 +55,30 @@ void GeneratorDisplay::setSignal(const juce::String& newType, float newLevelDb,
     levelDb = newLevelDb;
     sweepProgress = newSweepProgress;
     outputDevice = device;
+    repaint();
+}
+
+void GeneratorDisplay::setGeneratorSettings(float newBandLow, float newBandHigh,
+                                           float newToneFrequency,
+                                           float newSweepStart, float newSweepEnd)
+{
+    bandLow = std::max(1.0f, newBandLow);
+    bandHigh = std::max(bandLow, newBandHigh);
+    toneFrequency = std::max(1.0f, newToneFrequency);
+    sweepStart = std::max(1.0f, newSweepStart);
+    sweepEnd = std::max(sweepStart, newSweepEnd);
+    repaint();
+}
+
+void GeneratorDisplay::clear()
+{
+    samples.clear();
+    spectrum.valid = false;
+    peak = 0.0f;
+    rms = 0.0f;
+    slopeFrames = 0;
+    slopeValue = 0.0f;
+    repaint();
 }
 
 void GeneratorDisplay::setSamples(const std::vector<float>& newSamples, float newSampleRate)
@@ -75,6 +98,7 @@ void GeneratorDisplay::setSamples(const std::vector<float>& newSamples, float ne
     rms = samples.empty() ? 0.0f : (float) std::sqrt(sum / samples.size());
 
     analyse();
+    updateSlope();
     repaint();
 }
 
@@ -118,22 +142,114 @@ void GeneratorDisplay::analyse()
     spectrum.valid = true;
 }
 
-float GeneratorDisplay::octaveSlope() const
+float GeneratorDisplay::probeLevelDb(float frequency) const
+{
+    if (!spectrum.valid)
+        return dsp::dbFloor;
+
+    dsp::smoothMagnitudeDb(spectrum.freq, spectrum.magnitudeDb, 3, slopeCurve);
+
+    if (slopeCurve.size() != spectrum.magnitudeDb.size())
+        return dsp::dbFloor;
+
+    const auto index = juce::jlimit(0, (int) slopeCurve.size() - 1,
+                                    juce::roundToInt(frequency * analysisSize / sampleRate));
+    return slopeCurve[(size_t) index];
+}
+
+void GeneratorDisplay::updateSlope()
+{
+    const auto measured = measureSlope();
+
+    // Averaged over the captured blocks. One snapshot of a narrow band cannot pin the
+    // tilt to better than a decibel or two per octave, because the wiggle of a single
+    // noise realisation survives third octave smoothing; a running mean converges as
+    // soon as a few blocks have gone by.
+    slopeValue = slopeFrames == 0 ? measured : slopeValue + 0.25f * (measured - slopeValue);
+    ++slopeFrames;
+}
+
+float GeneratorDisplay::measureSlope() const
 {
     if (!spectrum.valid)
         return 0.0f;
 
-    auto levelAt = [&] (float freq)
+    dsp::smoothMagnitudeDb(spectrum.freq, spectrum.magnitudeDb, 3, slopeCurve);
+
+    if (slopeCurve.size() != spectrum.magnitudeDb.size())
+        return 0.0f;
+
+    auto levelAt = [&] (float frequency)
     {
-        const auto index = juce::jlimit(1, (int) spectrum.freq.size() - 1,
-                                        juce::roundToInt(freq * analysisSize / sampleRate));
-        return spectrum.magnitudeDb[(size_t) index];
+        const auto index = juce::jlimit(0, (int) slopeCurve.size() - 1,
+                                        juce::roundToInt(frequency * analysisSize / sampleRate));
+        return slopeCurve[(size_t) index];
     };
 
-    const auto low = levelAt(250.0f);
-    const auto high = levelAt(4000.0f);
+    // Two probe frequencies are not enough. One FFT bin of pink noise moves by several
+    // dB between neighbours, and at the bottom of the range a third of an octave holds
+    // only a handful of bins, so a pair reports the scatter of the estimate instead of
+    // the tilt. Fitting every third octave of the configured band averages it out.
+    const auto view = viewRange();
+    auto from = view.low;
+    auto to = view.high;
 
-    return (high - low) / 4.0f;
+    if (type.contains("Pink") && bandHigh > bandLow)
+    {
+        // Inset by a sixth of an octave so the tapered band edges stay out of the fit.
+        from = bandLow * std::pow(2.0f, 1.0f / 6.0f);
+        to = bandHigh / std::pow(2.0f, 1.0f / 6.0f);
+    }
+
+    const auto step = std::pow(2.0f, 1.0f / 3.0f);
+    double sumX = 0.0, sumY = 0.0, sumXX = 0.0, sumXY = 0.0;
+    auto count = 0;
+
+    for (auto frequency = from; frequency <= to * 1.001f; frequency *= step)
+    {
+        const auto level = levelAt(frequency);
+
+        if (level <= dsp::dbFloor + 0.5f)
+            continue;
+
+        const auto x = std::log2(frequency);
+        sumX += x;
+        sumY += level;
+        sumXX += x * x;
+        sumXY += x * level;
+        ++count;
+    }
+
+    const auto denominator = (double) count * sumXX - sumX * sumX;
+
+    if (count < 3 || std::abs(denominator) < 1.0e-9)
+        return 0.0f;
+
+    return (float) (((double) count * sumXY - sumX * sumY) / denominator);
+}
+
+dsp::FrequencyRange GeneratorDisplay::viewRange() const
+{
+    return dsp::generatorViewRange(type, bandLow, bandHigh, toneFrequency, sweepStart, sweepEnd);
+}
+
+juce::String GeneratorDisplay::settingsLabel() const
+{
+    auto asFrequency = [] (float freq)
+    {
+        return freq >= 1000.0f ? dsp::frequencyTickLabel(freq) : juce::String(freq, 0) + " Hz";
+    };
+
+    if (type.contains("Sine"))
+        return asFrequency(toneFrequency);
+
+    if (type.contains("Sweep"))
+        return asFrequency(sweepStart) + " - " + asFrequency(sweepEnd);
+
+    if (type.contains("Pink"))
+        return asFrequency(bandLow) + " - " + asFrequency(bandHigh);
+
+    return "20 Hz - 20k";
 }
 
 juce::Rectangle<float> GeneratorDisplay::waveformArea() const
@@ -173,24 +289,24 @@ void GeneratorDisplay::drawHeader(juce::Graphics& g, const juce::Rectangle<float
                area.reduced(14.0f).withTrimmedTop(28.0f).withHeight(24.0f),
                juce::Justification::left);
 
-    const auto peakText = "peak " + juce::String(dsp::db20(peak), 1) + " dBFS";
-    const auto rmsText = "rms " + juce::String(dsp::db20(rms), 1) + " dBFS";
-    const auto slopeText = spectrum.valid && type.contains("Pink")
-                         ? juce::String(octaveSlope(), 1) + " dB/oct"
-                         : (type.contains("Sweep") ? "sweep " + juce::String((int) (sweepProgress * 100.0f)) + " %"
-                                                   : juce::String(spectrum.valid ? octaveSlope() : 0.0f, 1) + " dB/oct");
-
-    g.drawText(peakText + "   " + rmsText + "   " + slopeText,
-               area.reduced(14.0f).withTrimmedTop(28.0f).withHeight(24.0f),
-               juce::Justification::right);
-
-    if (!samples.empty())
+    // Measured figures only mean something once a signal has been captured. Drawing
+    // "peak -200 dBFS" on a stopped generator would only be noise, and it collides with
+    // the output device name, which is the longest text in this row.
+    if (samples.empty())
         return;
 
-    g.setColour(juce::Colours::white.withAlpha(0.45f));
-    g.setFont(juce::Font(16.0f));
-    g.drawText("Belum ada sinyal - nyalakan generator setelah audio berjalan",
-               area.reduced(14.0f).withTrimmedTop(24.0f), juce::Justification::centred);
+    const auto peakText = "peak " + juce::String(dsp::db20(peak), 1) + " dBFS";
+    const auto rmsText = "rms " + juce::String(dsp::db20(rms), 1) + " dBFS";
+
+    // Each signal gets the figure that describes it: a tilt for noise, a position for
+    // a sweep and the frequency for a tone.
+    const auto detail = type.contains("Sweep") ? "sweep " + juce::String((int) (sweepProgress * 100.0f)) + " %"
+                         : type.contains("Sine") ? settingsLabel()
+                         : juce::String(octaveSlope(), 1) + " dB/oct";
+
+    g.drawText(peakText + "   " + rmsText + "   " + detail,
+               area.reduced(14.0f).withTrimmedTop(28.0f).withHeight(24.0f),
+               juce::Justification::right);
 }
 
 void GeneratorDisplay::drawWaveform(juce::Graphics& g, const juce::Rectangle<float>& plot) const
@@ -240,6 +356,16 @@ void GeneratorDisplay::drawWaveform(juce::Graphics& g, const juce::Rectangle<flo
 
 void GeneratorDisplay::drawSpectrum(juce::Graphics& g, const juce::Rectangle<float>& plot) const
 {
+    const auto view = viewRange();
+    const auto logLow = std::log10(view.low);
+    const auto logSpan = std::log10(view.high) - logLow;
+
+    auto toX = [&] (float freq)
+    {
+        return plot.getX() + (std::log10(juce::jlimit(view.low, view.high, freq)) - logLow)
+                                        / logSpan * plot.getWidth();
+    };
+
     g.setColour(gridColour);
 
     for (int division = 0; division <= 4; ++division)
@@ -248,20 +374,33 @@ void GeneratorDisplay::drawSpectrum(juce::Graphics& g, const juce::Rectangle<flo
         g.fillRect(plot.getX(), y, plot.getWidth(), 1.0f);
     }
 
-    for (int decade = 1; decade <= 4; ++decade)
-    {
-        const auto freq = std::pow(10.0f, (float) decade);
-        const auto x = plot.getX() + (std::log10(freq) - std::log10(minFrequency))
-                                        / (std::log10(maxFrequency) - std::log10(minFrequency))
-                                        * plot.getWidth();
+    // Tick count follows the plot width so the labels cannot overlap on a narrow window.
+    const auto ticks = dsp::logAxisTicks(view.low, view.high,
+                                         std::max(2, (int) (plot.getWidth() / 62.0f)));
 
-        g.setColour(gridBoldColour);
-        g.fillRect(x, plot.getY(), 1.0f, plot.getHeight());
+    g.setColour(gridBoldColour);
+
+    for (const auto freq : ticks)
+        g.fillRect(toX(freq), plot.getY(), 1.0f, plot.getHeight());
+
+    // Shade the configured range, so the trace can be read against the setting the user
+    // picked instead of guessing where the band edges are.
+    if (type.contains("Pink"))
+    {
+        const auto left = toX(bandLow);
+        const auto right = toX(bandHigh);
+
+        if (right > left)
+        {
+            g.setColour(bandShadeColour);
+            g.fillRect(left, plot.getY(), right - left, plot.getHeight());
+        }
     }
 
     g.setColour(mutedColour);
     g.setFont(juce::Font(12.0f));
-    g.drawText("Spektrum generator", plot.withY(plot.getY() - 22.0f).withHeight(20.0f),
+    g.drawText("Spektrum generator   " + settingsLabel(),
+               plot.withY(plot.getY() - 22.0f).withHeight(20.0f),
                juce::Justification::left);
 
     if (!spectrum.valid)
@@ -270,8 +409,15 @@ void GeneratorDisplay::drawSpectrum(juce::Graphics& g, const juce::Rectangle<flo
     auto topDb = -20.0f;
     auto bottomDb = -110.0f;
 
-    for (auto value : spectrum.magnitudeDb)
+    for (size_t i = 0; i < spectrum.freq.size(); ++i)
     {
+        const auto freq = spectrum.freq[i];
+
+        if (freq < view.low || freq > view.high)
+            continue;
+
+        const auto value = spectrum.magnitudeDb[i];
+
         if (value > topDb)
             topDb = value;
 
@@ -288,15 +434,13 @@ void GeneratorDisplay::drawSpectrum(juce::Graphics& g, const juce::Rectangle<flo
     {
         const auto freq = spectrum.freq[i];
 
-        if (freq < minFrequency)
+        if (freq < view.low)
             continue;
 
-        if (freq > maxFrequency)
+        if (freq > view.high)
             break;
 
-        const auto x = plot.getX() + (std::log10(freq) - std::log10(minFrequency))
-                                        / (std::log10(maxFrequency) - std::log10(minFrequency))
-                                        * plot.getWidth();
+        const auto x = toX(freq);
         const auto fraction = juce::jlimit(0.0f, 1.0f, (spectrum.magnitudeDb[i] - bottomDb) / (topDb - bottomDb));
         const auto y = plot.getBottom() - fraction * plot.getHeight();
 
@@ -314,18 +458,36 @@ void GeneratorDisplay::drawSpectrum(juce::Graphics& g, const juce::Rectangle<flo
     g.setColour(spectrumColour);
     g.strokePath(path, juce::PathStrokeType(1.5f));
 
-    for (int decade = 1; decade <= 4; ++decade)
+    // Sweep moves, so the tone that should be sounding right now gets a marker.
+    if (type.contains("Sweep"))
     {
-        const auto freq = std::pow(10.0f, (float) decade);
-        const auto x = plot.getX() + (std::log10(freq) - std::log10(minFrequency))
-                                        / (std::log10(maxFrequency) - std::log10(minFrequency))
-                                        * plot.getWidth();
+        const auto progress = juce::jlimit(0.0f, 1.0f, sweepProgress);
+        const auto current = sweepStart * std::pow(sweepEnd / sweepStart, progress);
 
-        g.setColour(mutedColour);
-        g.setFont(juce::Font(11.0f));
-        g.drawText(decade == 3 ? "1k" : (juce::String(freq >= 1000.0f ? (int) freq / 1000 : (int) freq)
-                                         + (decade == 4 ? "k" : "")),
-                   x - 20.0f, plot.getBottom() + 2.0f, 40.0f, 14.0f,
+        if (current >= view.low && current <= view.high)
+        {
+            const auto x = toX(current);
+
+            g.setColour(gridBoldColour);
+            g.fillRect(x, plot.getY(), 1.0f, plot.getHeight());
+
+            g.setColour(textColour);
+            g.setFont(juce::Font(11.0f));
+            g.drawText(dsp::frequencyTickLabel(current),
+                       juce::jlimit(plot.getX(), plot.getRight() - 40.0f, x - 20.0f),
+                       plot.getY() + 2.0f, 40.0f, 14.0f, juce::Justification::centred);
+        }
+    }
+
+    g.setColour(mutedColour);
+    g.setFont(juce::Font(11.0f));
+
+    for (const auto freq : ticks)
+    {
+        const auto x = toX(freq);
+        g.drawText(dsp::frequencyTickLabel(freq),
+                   juce::jlimit(plot.getX(), plot.getRight() - 40.0f, x - 20.0f),
+                   plot.getBottom() + 2.0f, 40.0f, 14.0f,
                    juce::Justification::centred);
     }
 
@@ -354,6 +516,16 @@ void GeneratorDisplay::paint(juce::Graphics& g)
 
     drawWaveform(g, waveBounds);
     drawSpectrum(g, spectrumBounds);
+
+    // The prompt belongs in the empty plot, not in the header, where the output device
+    // name already runs the full width.
+    if (!samples.empty())
+        return;
+
+    g.setColour(juce::Colours::white.withAlpha(0.45f));
+    g.setFont(juce::Font(16.0f));
+    g.drawText("Belum ada sinyal - nyalakan generator setelah audio berjalan",
+               waveBounds.reduced(12.0f), juce::Justification::centred);
 }
 
 void GeneratorDisplay::resized()
