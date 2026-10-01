@@ -12,8 +12,12 @@ JUCE/.cache/
 *.o
 *.a
 
-# Release artefacts are attached to GitHub Releases, not committed
-dist/
+# Release artefacts. The packaged tarball and its notes are committed so they can be
+# downloaded straight from the repository. The unpacked staging directory is not: it
+# only duplicates what is inside the tarball.
+dist/*/
+dist/*.tar.gz.asc
+dist/*.sig
 
 # Local measurements and calibration downloads
 99-*.csv
