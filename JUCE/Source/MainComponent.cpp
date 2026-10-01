@@ -129,8 +129,17 @@ MainComponent::MainComponent()
         generator.setType(SignalGenerator::typeFromName(name));
         generatorDelayValid = false;
         transferFunction.reset();
+        updateGeneratorGeneratorControls();
         updateGeneratorInfo();
     };
+
+    // A text box beside the slider, so an exact frequency can be typed instead of
+    // hunted for with the mouse. This matters for measurement: 997 Hz matters more
+    // than "about 1000 Hz" when lining up a sweep point.
+    generatorFrequencyEditor.setTooltip ("Frekuensi dapat diketik langsung, mis. 997 atau 1000.5");
+    generatorFrequencyEditor.setTextToShowWhenEmpty ("Hz", mutedColour);
+    generatorFrequencyEditor.addListener (&frequencyEditorListener);
+    generatorFrequencyEditor.setKeyboardType (juce::TextEditor::numericKeyboard);
 
     generatorLevelSlider.setRange(-60.0, 0.0, 0.5);
     generatorLevelSlider.setValue(-24.0);
@@ -142,14 +151,18 @@ MainComponent::MainComponent()
         updateGeneratorInfo();
     };
 
-    generatorFrequencySlider.setRange(20.0, 20000.0, 1.0);
+generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     generatorFrequencySlider.setSkewFactorFromMidPoint(1000.0f);
     generatorFrequencySlider.setValue(1000.0);
     generatorFrequencySlider.setTextValueSuffix(" Hz");
     generatorFrequencySlider.onValueChange = [this]
     {
-        audioEngine.getGenerator().setFrequency((float) generatorFrequencySlider.getValue());
-        updateGeneratorInfo();
+        const auto value = (float) generatorFrequencySlider.getValue();
+        audioEngine.getGenerator().setFrequency(value);
+
+        if (! isEditingGeneratorFrequency())
+            generatorFrequencyEditor.setText (juce::String (juce::roundToInt (value)),
+                                             juce::dontSendNotification);
     };
 
     generatorSweepStartSlider.setRange(20.0, 2000.0, 1.0);
@@ -212,6 +225,7 @@ MainComponent::MainComponent()
     generatorPanel.addAndMakeVisible(generatorTypeSelector);
     generatorPanel.addAndMakeVisible(generatorLevelSlider);
     generatorPanel.addAndMakeVisible(generatorFrequencySlider);
+    generatorPanel.addAndMakeVisible(generatorFrequencyEditor);
     generatorPanel.addAndMakeVisible(generatorSweepStartSlider);
     generatorPanel.addAndMakeVisible(generatorSweepEndSlider);
     generatorPanel.addAndMakeVisible(generatorSweepDurationSlider);
@@ -253,6 +267,7 @@ MainComponent::MainComponent()
     refreshDeviceSelectors();
     updateGeneratorInfo();
     updateStatus();
+    updateGeneratorGeneratorControls();
 
     startTimerHz(30);
 }
@@ -1213,6 +1228,102 @@ void MainComponent::componentMovedOrResized(juce::Component& component, bool, bo
         layoutGenerator();
 }
 
+// TextEditor hides its focus state, so the flag is tracked from the listener events
+// that can change it rather than guessed at paint time.
+bool MainComponent::isEditingGeneratorFrequency() const
+{
+    return frequencyEditorActive;
+}
+
+void MainComponent::FrequencyEditorListener::textEditorReturnKeyPressed (juce::TextEditor&)
+{
+    component.frequencyEditorActive = false;
+    component.applyTypedFrequency();
+}
+
+void MainComponent::FrequencyEditorListener::textEditorEscapeKeyPressed (juce::TextEditor&)
+{
+    // Escape abandons the edit and restores the slider's value, which is what someone
+    // who types a number and then changes their mind expects.
+    component.frequencyEditorActive = false;
+    component.updateGeneratorFrequencyEditor();
+}
+
+void MainComponent::FrequencyEditorListener::textEditorFocusLost (juce::TextEditor&)
+{
+    component.frequencyEditorActive = false;
+    component.applyTypedFrequency();
+}
+
+void MainComponent::applyTypedFrequency()
+{
+    const auto typed = generatorFrequencyEditor.getText().trim();
+
+    if (typed.isEmpty())
+    {
+        updateGeneratorFrequencyEditor();
+        return;
+    }
+
+    const auto parsed = typed.getFloatValue();
+
+    if (parsed < 1.0f)
+    {
+        statusLabel.setText ("Frekuensi harus antara 1 Hz dan 20000 Hz", juce::dontSendNotification);
+        updateGeneratorFrequencyEditor();
+        return;
+    }
+
+    const auto clamped = juce::jlimit(1.0f, 20000.0f, parsed);
+
+    generatorFrequencySlider.setValue ((double) clamped, juce::sendNotificationSync);
+    audioEngine.getGenerator().setFrequency (clamped);
+    updateGeneratorFrequencyEditor();
+
+    if (std::abs (clamped - parsed) > 0.05f)
+        statusLabel.setText ("Frekuensi dibatasi ke 20000 Hz", juce::dontSendNotification);
+    else
+        statusLabel.setText ("Frekuensi generator: " + juce::String (parsed, 1) + " Hz",
+                             juce::dontSendNotification);
+}
+
+void MainComponent::updateGeneratorFrequencyEditor()
+{
+    if (isEditingGeneratorFrequency())
+        return;
+
+    const auto value = (float) generatorFrequencySlider.getValue();
+
+    // Decimals are shown only when they matter, so 1000 stays "1000" but 997.5 keeps
+    // its decimal. Measurement frequencies are never rounded away.
+    generatorFrequencyEditor.setText (juce::String (value, value < 100.0f || std::fmod (value, 1.0f) > 0.05f ? 1 : 0),
+                                      juce::dontSendNotification);
+}
+
+void MainComponent::updateGeneratorGeneratorControls()
+{
+    const auto type = audioEngine.getGenerator().getType();
+    const auto manualFrequency = type == SignalGenerator::Type::Sine;
+    const auto sweep = type == SignalGenerator::Type::LogSweep;
+
+    // Controls that do nothing for the current type are dimmed rather than removed,
+    // so the layout does not jump when switching between them.
+    generatorFrequencyLabel.setEnabled (manualFrequency);
+    generatorFrequencySlider.setEnabled (manualFrequency);
+    generatorFrequencyEditor.setEnabled (manualFrequency);
+    generatorFrequencyEditor.setAlpha (manualFrequency ? 1.0f : 0.4f);
+
+    for (auto* label : { &generatorSweepStartLabel, &generatorSweepEndLabel,
+                         &generatorSweepDurationLabel })
+        label->setEnabled (sweep);
+
+    generatorSweepStartSlider.setEnabled (sweep);
+    generatorSweepEndSlider.setEnabled (sweep);
+    generatorSweepDurationSlider.setEnabled (sweep);
+
+    updateGeneratorFrequencyEditor();
+}
+
 void MainComponent::layoutGenerator()
 {
     auto area = generatorPanel.getLocalBounds().reduced(20);
@@ -1237,7 +1348,10 @@ void MainComponent::layoutGenerator()
     column.removeFromTop(12);
 
     generatorFrequencyLabel.setBounds(column.removeFromTop(24));
-    generatorFrequencySlider.setBounds(column.removeFromTop(36).reduced(0, 4));
+    auto frequencyRow = column.removeFromTop(36).reduced(0, 4);
+    generatorFrequencyEditor.setBounds(frequencyRow.removeFromLeft(70).reduced(0, 2));
+    frequencyRow.removeFromLeft(6);
+    generatorFrequencySlider.setBounds(frequencyRow);
 
     auto sweepColumn = panel;
 

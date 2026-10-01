@@ -34,6 +34,10 @@ private:
     void loadSnapshotClicked();
     void clearSnapshotClicked();
     void updateCalibrationLabel();
+    void applyTypedFrequency();
+    void updateGeneratorFrequencyEditor();
+    bool isEditingGeneratorFrequency() const;
+    void updateGeneratorGeneratorControls();
     void populateSnapshotMenu();
     void chooseSnapshotFile();
     void loadSnapshotFile (const juce::File& file);
@@ -96,6 +100,29 @@ private:
     juce::ComboBox generatorTypeSelector;
     juce::Slider generatorLevelSlider;
     juce::Slider generatorFrequencySlider;
+    // A plain Label cannot take typed input, so this is a TextEditor styled to match
+    // the rest of the panel. Typing an exact frequency matters for measurement:
+    // 997 Hz is not "about 1000 Hz" when lining up a sweep point.
+    // TextEditor reports focus through a Listener rather than a callback, so this
+    // small adapter tracks whether the user is mid-edit. Without it, the sync from
+    // slider back into the box would fight the user while they type.
+    class FrequencyEditorListener : public juce::TextEditor::Listener
+    {
+    public:
+        explicit FrequencyEditorListener (MainComponent& owner) : component (owner) {}
+
+        void textEditorReturnKeyPressed (juce::TextEditor&) override;
+        void textEditorEscapeKeyPressed (juce::TextEditor&) override;
+        void textEditorFocusLost (juce::TextEditor&) override;
+
+        MainComponent& component;
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FrequencyEditorListener)
+    };
+
+    juce::TextEditor generatorFrequencyEditor;
+    FrequencyEditorListener frequencyEditorListener { *this };
+    bool frequencyEditorActive = false;
     juce::Slider generatorSweepStartSlider;
     juce::Slider generatorSweepEndSlider;
     juce::Slider generatorSweepDurationSlider;
