@@ -39,6 +39,25 @@ public:
     float getBandLow() const { return bandLow; }
     float getBandHigh() const { return bandHigh; }
 
+    struct BandPreset
+    {
+        juce::String name;
+        float lowFrequency = 20.0f;
+        float highFrequency = 20000.0f;
+    };
+
+    /** One band per driver, from subwoofer to tweeter.
+
+        Room correction is done one driver at a time: coherence and level are only
+        meaningful inside the band that the driver actually reproduces, so a preset per
+        driver keeps that measurement honest instead of averaging a tweeter with a
+        subwoofer.
+    */
+    static juce::Array<BandPreset> getBandPresets();
+
+    /** Index of the preset these limits match, or -1 when the band is a custom one. */
+    static int findBandPreset (float lowFrequency, float highFrequency);
+
     void setRunning(bool shouldRun);
     bool isRunning() const { return running; }
 

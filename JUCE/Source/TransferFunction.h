@@ -16,6 +16,13 @@ public:
         std::vector<float> refMagnitudeDb;
         std::vector<float> measMagnitudeDb;
         std::vector<float> impulseResponse;
+        /** One entry per bin: false where the reference is too weak to measure. A blanked
+            bin carries no magnitude and no coherence, so it must not be drawn or
+            averaged in. */
+        std::vector<char> binValid;
+        int validBins = 0;
+        int blankedBins = 0;
+        float peakReferenceDb = dsp::dbFloor;
         float delaySamples = 0.0f;
         float delayMs = 0.0f;
         float averageCoherence = 0.0f;
@@ -39,6 +46,20 @@ public:
 
     void setAutomaticDelay(bool shouldTrack, float maxLagMs = 500.0f);
     bool isAutomaticDelayEnabled() const { return automaticDelayEnabled; }
+
+    /** How far below the strongest reference bin a bin may sit and still be measured.
+
+        A band limited signal leaves most of the spectrum empty, and the coherence there
+        is the ratio of two near-zero powers: undefined, and reported as a confident 1.0
+        if it is divided out anyway. Everything below this range is blanked instead.
+    */
+    void setBlankingRangeDb(float rangeDb);
+    float getBlankingRangeDb() const { return blankingRangeDb; }
+
+    /** Searches for the delay once, over the whole analysed block, and restarts the
+        averages so every averaged frame shares one compensation. Returns the delay in
+        samples, negative when the measurement arrives first. */
+    float findDelay(const float* ref, const float* meas);
 
     void setManualDelay(float delaySamples);
     float getDelaySamples() const { return delaySamples; }
@@ -68,6 +89,8 @@ private:
     float delaySamples = 0.0f;
     float delayMs = 0.0f;
     float smoothingAlpha = 1.0f;
+    float blankingRangeDb = 60.0f;
+    int delaySearchFrames = 0;
 
     dsp::Spectrum refSpectrum;
     dsp::Spectrum measSpectrum;

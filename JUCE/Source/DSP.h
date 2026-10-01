@@ -2,6 +2,7 @@
 
 #include <juce_core/juce_core.h>
 #include <juce_dsp/juce_dsp.h>
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <limits>
@@ -480,6 +481,143 @@ namespace dsp
         }
 
         return bars;
+    }
+
+    /** Frequency window the generator spectrum is drawn over.
+
+        The generator display has to follow the settings the user picked: a tone or a
+        narrow pink noise band collapses into a single pixel on a fixed 20 Hz - 20 kHz
+        axis, so the axis zooms onto the configured range instead. The rules live here
+        rather than in the display component so the tests can assert them without
+        pulling in the GUI modules.
+    */
+    struct FrequencyRange
+    {
+        float low = 20.0f;
+        float high = 20000.0f;
+    };
+
+    inline FrequencyRange generatorViewRange(const juce::String& type,
+                                             float bandLow, float bandHigh,
+                                             float toneFrequency,
+                                             float sweepStart, float sweepEnd)
+    {
+        auto low = 20.0f;
+        auto high = 20000.0f;
+
+        if (type.contains("Sine"))
+        {
+            low = high = toneFrequency;
+        }
+        else if (type.contains("Sweep"))
+        {
+            low = sweepStart;
+            high = sweepEnd;
+        }
+        else if (type.contains("Pink"))
+        {
+            low = bandLow;
+            high = bandHigh;
+        }
+
+        // A tone gives low == high, which is a valid zero octave span, so the guard
+        // rejects only ranges that are inverted or non positive.
+        if (! (low > 0.0f) || ! (high >= low))
+            return { 20.0f, 20000.0f };
+
+        // Padding grows as the configured range narrows, so the rolled-off edges stay
+        // visible. It reaches one octave each side for a tone and disappears once the
+        // range covers the full 20 Hz - 20 kHz band.
+        const auto fullBandOctaves = std::log2(20000.0f / 20.0f);
+        const auto spanOctaves = std::log2(high / low);
+        const auto padOctaves = juce::jlimit(0.0f, 1.0f, (fullBandOctaves - spanOctaves) / 4.0f);
+
+        return { std::max(5.0f, low * std::pow(2.0f, -padOctaves)),
+                 std::min(48000.0f, high * std::pow(2.0f, padOctaves)) };
+    }
+
+    /** Picks the measurement and the reference out of the two captured input channels.
+
+        The engine hands the channels back in physical order, so which one is the
+        measurement is a wiring decision. Assigning both to the same channel would compare
+        a signal with itself, so the caller must keep them apart. A missing second channel
+        leaves the reference silent rather than copying the measurement, which would read
+        as a perfectly flat transfer function.
+    */
+    inline void assignMeasurementAndReference(int measurementChannel,
+                                              const std::vector<float>& left,
+                                              const std::vector<float>& right,
+                                              std::vector<float>& measurement,
+                                              std::vector<float>& reference)
+    {
+        const auto onLeft = measurementChannel == 0;
+
+        measurement = onLeft ? left : right;
+
+        if (right.empty())
+        {
+            // Only one input is present, so the reference stays silent instead of
+            // copying the measurement, which would read as a flat transfer function.
+            reference.assign(measurement.size(), 0.0f);
+            return;
+        }
+
+        reference = onLeft ? right : left;
+
+        // The analysis walks both together, so a mismatch would read past the end of the
+        // shorter one. Trimming keeps them aligned; padding would invent silence.
+        const auto count = std::min(measurement.size(), reference.size());
+        measurement.resize(count);
+        reference.resize(count);
+    }
+
+    /** Round 1-2-5 frequencies inside a log axis, thinned to fit the available width.
+
+        Labels stay on round values instead of arbitrary log positions, and dropping
+        every other tick keeps a narrow zoom from printing labels on top of each other.
+    */
+    inline std::vector<float> logAxisTicks(float low, float high, int maxTicks)
+    {
+        std::vector<float> ticks;
+
+        if (! (low > 0.0f) || ! (high > low) || maxTicks < 2)
+            return ticks;
+
+        for (int decade = 0; decade <= 9; ++decade)
+        {
+            const auto base = std::pow(10.0f, (float) decade);
+
+            for (const auto mantissa : { 1.0f, 2.0f, 5.0f })
+            {
+                const auto freq = base * mantissa;
+
+                if (freq >= low && freq <= high)
+                    ticks.push_back(freq);
+            }
+        }
+
+        while ((int) ticks.size() > maxTicks)
+        {
+            std::vector<float> thinned;
+
+            for (size_t i = 0; i < ticks.size(); i += 2)
+                thinned.push_back(ticks[i]);
+
+            ticks.swap(thinned);
+        }
+
+        return ticks;
+    }
+
+    inline juce::String frequencyTickLabel(float frequency)
+    {
+        if (frequency >= 1000.0f)
+        {
+            const auto value = frequency / 1000.0f;
+            return juce::String(value, std::abs(value - std::round(value)) < 0.05f ? 0 : 1) + "k";
+        }
+
+        return juce::String(std::max(1, juce::roundToInt(frequency)));
     }
 
     class DelayFinder

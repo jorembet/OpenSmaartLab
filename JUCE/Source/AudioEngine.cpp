@@ -704,18 +704,63 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
     const auto channels = std::min(2, numInputChannels);
     capturedChannels.store(channels);
 
-    // Render once: all speakers and the reference receive the exact same samples.
-    const bool hasOutput = outputChannelData != nullptr && numOutputChannels > 0
-                       && outputChannelData[0] != nullptr;
-    if (hasOutput)
+    // Render once into the first channel that carries the signal, then copy it to the
+    // other enabled side so both get the exact same samples. A channel left out of the
+    // routing is silenced rather than left holding whatever was there before.
+    const auto routing = generatorRouting.load();
+    auto hasOutput = false;
+    auto firstEnabled = -1;
+
+    if (outputChannelData != nullptr && numOutputChannels > 0)
     {
-        generator.process(outputChannelData[0], numSamples, 1.0f);
-        for (int ch = 1; ch < numOutputChannels; ++ch)
-            if (outputChannelData[ch] != nullptr)
-                juce::FloatVectorOperations::copy(outputChannelData[ch], outputChannelData[0], numSamples);
+        for (int ch = 0; ch < numOutputChannels; ++ch)
+        {
+            if (outputChannelData[ch] == nullptr)
+                continue;
+
+            // A mono device has no side to pick, so it always carries the signal.
+            const auto mono = numOutputChannels < 2;
+            const auto enabled = mono
+                              || routing == OutputRouting::Both
+                              || (routing == OutputRouting::Left && ch == 0)
+                              || (routing == OutputRouting::Right && ch == 1);
+
+            if (enabled)
+            {
+                if (firstEnabled < 0)
+                    firstEnabled = ch;
+            }
+            else
+            {
+                juce::FloatVectorOperations::clear(outputChannelData[ch], numSamples);
+            }
+        }
+    }
+
+    if (firstEnabled >= 0)
+    {
+        hasOutput = true;
+        generator.process(outputChannelData[firstEnabled], numSamples, 1.0f);
+
+        for (int ch = 0; ch < numOutputChannels; ++ch)
+        {
+            if (ch == firstEnabled || outputChannelData[ch] == nullptr)
+                continue;
+
+            const auto enabled = numOutputChannels < 2
+                              || routing == OutputRouting::Both
+                              || (routing == OutputRouting::Left && ch == 0)
+                              || (routing == OutputRouting::Right && ch == 1);
+
+            if (enabled)
+                juce::FloatVectorOperations::copy(outputChannelData[ch],
+                                                  outputChannelData[firstEnabled], numSamples);
+        }
+
         const juce::ScopedLock lock(generatorLock);
         const auto count = std::min(numSamples, (int) generatorCapture.size());
-        juce::FloatVectorOperations::copy(generatorCapture.data(), outputChannelData[0], count);
+        juce::FloatVectorOperations::copy(generatorCapture.data(),
+                                          outputChannelData[firstEnabled], count);
         capturedGeneratorSamples = count;
     }
 
@@ -727,7 +772,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
     {
         ringBuffer[0][(size_t) position] = channels > 0 && inputChannelData[0] != nullptr ? inputChannelData[0][i] : 0.0f;
         ringBuffer[1][(size_t) position] = channels > 1 && inputChannelData[1] != nullptr ? inputChannelData[1][i] : 0.0f;
-        ringBuffer[2][(size_t) position] = hasOutput ? outputChannelData[0][i] : 0.0f;
+        ringBuffer[2][(size_t) position] = hasOutput ? outputChannelData[firstEnabled][i] : 0.0f;
         position = (position + 1) % capacity;
     }
     writePosition.store(position);
@@ -744,8 +789,18 @@ void AudioEngine::getGeneratorOutput(std::vector<float>& target)
                                                          (int) generatorCapture.size()));
 }
 
-void AudioEngine::getLatestBlock(int numSamples, std::vector<float>& ref,
-                                 std::vector<float>& meas, std::vector<float>* generated)
+juce::String AudioEngine::channelName(int channelIndex)
+{
+    switch (channelIndex)
+    {
+        case 0:  return "Kiri (Ch1)";
+        case 1:  return "Kanan (Ch2)";
+        default: return "Ch " + juce::String(channelIndex + 1);
+    }
+}
+
+void AudioEngine::getLatestBlock(int numSamples, std::vector<float>& left,
+                                 std::vector<float>& right, std::vector<float>* generated)
 {
     std::lock_guard<std::mutex> lock(bufferMutex);
 
@@ -754,8 +809,8 @@ void AudioEngine::getLatestBlock(int numSamples, std::vector<float>& ref,
 
     if (ringBuffer.size() < 3 || capacity <= 0)
     {
-        ref.clear();
-        meas.clear();
+        left.clear();
+        right.clear();
         return;
     }
 
@@ -764,23 +819,23 @@ void AudioEngine::getLatestBlock(int numSamples, std::vector<float>& ref,
 
     if (count <= 0)
     {
-        ref.clear();
-        meas.clear();
+        left.clear();
+        right.clear();
         return;
     }
 
     const auto start = (writePosition.load() - count + capacity) % capacity;
 
-    ref.resize((size_t) count);
-    meas.resize((size_t) count);
+    left.resize((size_t) count);
+    right.resize((size_t) count);
     if (generated != nullptr)
         generated->resize((size_t) count);
 
     for (int i = 0; i < count; ++i)
     {
         const auto index = (size_t) ((start + i) % capacity);
-        ref[(size_t) i] = ringBuffer[0][index];
-        meas[(size_t) i] = ringBuffer[1][index];
+        left[(size_t) i] = ringBuffer[0][index];
+        right[(size_t) i] = ringBuffer[1][index];
         if (generated != nullptr)
             (*generated)[(size_t) i] = ringBuffer[2][index];
     }
