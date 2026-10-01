@@ -12,7 +12,7 @@ Two implementations live in this repository:
 
 Use the C++ build for serious work: it is the only one that keeps a two-channel
 measurement stable under load, and the only one with the Transfer Function tab, the
-per-driver generator bands and separate left/right channel assignment.
+spectrogram, the per-driver generator bands and separate left/right channel assignment.
 
 ![RTA tab](docs/rta.png)
 
@@ -22,7 +22,7 @@ per-driver generator bands and separate left/right channel assignment.
 
 | Tab | What it is for |
 | --- | --- |
-| **RTA / Delay** | Live spectrum against live input, plus the delay reading |
+| **RTA / Delay** | Live spectrum against live input, as bands, bars, a line or a spectrogram, plus the delay reading |
 | **Transfer Function** | Magnitude, phase and coherence of one dual-channel measurement |
 | **Reverberation** | Impulse response, energy decay curve, Schroeder decay, RT estimates |
 | **SPL Meter** | Sound pressure level with A / C / Z weighting, peak and Leq |
@@ -55,8 +55,8 @@ per-driver generator bands and separate left/right channel assignment.
 
 ### RTA display
 
-- Three styles: octave bands, 100 evenly spaced bars on a linear frequency axis, or a
-  scrolling spectrogram
+- Four views from the same display: octave bands, 100 evenly spaced bars on a linear
+  frequency axis, a plain FFT line, and a scrolling spectrogram
 - Band resolution from 1/1 octave up to 1/12 octave
 - Band centres follow the ISO 266 nominal frequency table (20 Hz, 25, 31.5, 40, …)
 - Every band is labelled with its frequency, sized so all 31 labels fit
@@ -220,8 +220,9 @@ Two targets:
   snapshot round trip.
 - `ui_checks` builds the real panels, drives the controls and writes screenshots to
   `/tmp`: that a driver band reaches the generator, that a hand set band reports itself
-  as manual, that the channel assignment and output routing reach the audio engine, and
-  that the Transfer Function tab renders magnitude, phase and coherence.
+  as manual, that the channel assignment and output routing reach the audio engine, that
+  the Transfer Function tab renders magnitude, phase and coherence, and that the
+  spectrogram records its history with the newest frame along the bottom
 
 `xvfb-run` is needed because the UI checks need a display server; without it the GUI
 target cannot start.
