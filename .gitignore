@@ -12,6 +12,9 @@ JUCE/.cache/
 *.o
 *.a
 
+# Release artefacts are attached to GitHub Releases, not committed
+dist/
+
 # Local measurements and calibration downloads
 99-*.csv
 99-*.txt
