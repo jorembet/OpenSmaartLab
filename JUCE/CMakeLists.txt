@@ -31,6 +31,7 @@ target_sources(OpenSmaartLab PRIVATE
     Source/ReverbDisplay.cpp
     Source/SPLMeter.cpp
     Source/TransferFunction.cpp
+    Source/TransferFunctionDisplay.cpp
     Source/ImpulseResponse.cpp
     Source/SignalGenerator.cpp
 )
@@ -64,6 +65,7 @@ target_sources(OpenSmaartLabAudioChecks PRIVATE
     Source/MicrophoneCalibration.cpp
     Source/RTASnapshot.cpp
     Source/SignalGenerator.cpp
+    Source/TransferFunction.cpp
 )
 
 target_compile_definitions(OpenSmaartLabAudioChecks PRIVATE
@@ -99,6 +101,7 @@ target_sources(OpenSmaartLabUiChecks PRIVATE
     Source/ReverbDisplay.cpp
     Source/SPLMeter.cpp
     Source/TransferFunction.cpp
+    Source/TransferFunctionDisplay.cpp
     Source/ImpulseResponse.cpp
     Source/SignalGenerator.cpp
 )
@@ -108,6 +111,7 @@ target_compile_definitions(OpenSmaartLabUiChecks PRIVATE
     JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_REPORT_APP_USAGE=0
     JUCE_STANDALONE_APPLICATION=1
+    JUCE_WEB_BROWSER=0
 )
 
 target_link_libraries(OpenSmaartLabUiChecks PRIVATE

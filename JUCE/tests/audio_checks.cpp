@@ -4,6 +4,9 @@
 #include "RTASnapshot.h"
 #include "FrequencyLabels.h"
 #include "SignalGenerator.h"
+#include "TransferFunction.h"
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <random>
@@ -56,7 +59,14 @@ int main()
     require(first.size() == 1024 && std::abs(first.back() - 0.399f) < 0.0001f,
             "Microphone buffer must keep updating after 8 seconds");
     require(engine.getCapturedChannels() == 1 && second.back() == 0.0f,
-            "Mono capture must not fabricate a reference signal");
+            "Mono capture must not fabricate a second channel");
+
+    // Channels are named the way the toolbar offers them, so the assignment, the plot and
+    // the messages all describe a channel identically.
+    require(AudioEngine::channelName(0) == "Kiri (Ch1)"
+                && AudioEngine::channelName(1) == "Kanan (Ch2)"
+                && AudioEngine::channelName(4) == "Ch 5",
+            "Input channels must be named left, right and by number beyond the pair");
     engine.audioDeviceAboutToStart(nullptr);
     engine.getGenerator().setRunning(true);
     std::vector<float> played;
@@ -83,6 +93,120 @@ int main()
             "Matching pink noise must have high delay confidence");
     std::fill(first.begin(), first.end(), 0.0f);
     require(dsp::delayConfidence(generated, first, 0) == 0.0f, "Silence must not report a valid delay");
+
+    // ---- Measurement and reference channel assignment ----
+    // The engine returns the channels in physical order, so which one is the measurement
+    // is a wiring decision. Both outputs must come back the same length: the analysis
+    // walks them together, so an empty one reads past the end of the other.
+    {
+        std::vector<float> left(64), right(64);
+
+        for (size_t i = 0; i < left.size(); ++i)
+        {
+            left[i] = 0.25f;
+            right[i] = -0.5f;
+        }
+
+        std::vector<float> meas, ref;
+
+        dsp::assignMeasurementAndReference(0, left, right, meas, ref);
+        require(meas == left && ref == right,
+                "Measuring the left input must take the reference from the right");
+
+        dsp::assignMeasurementAndReference(1, left, right, meas, ref);
+        require(meas == right && ref == left,
+                "Measuring the right input must take the reference from the left");
+
+        require(meas.size() == ref.size(),
+                "Measurement and reference must always come back the same length");
+
+        // A mono device has one channel only. The reference stays silent instead of
+        // copying the measurement, which would read as a perfectly flat transfer function.
+        const std::vector<float> noRight;
+        dsp::assignMeasurementAndReference(0, left, noRight, meas, ref);
+        require(meas == left, "A mono input must supply the measurement");
+        require(std::all_of(ref.begin(), ref.end(), [] (float v) { return v == 0.0f; }),
+                "A mono input must leave the reference silent");
+
+        // A mismatched pair must still come back aligned, or the loops that read both
+        // together would run off the end of the shorter one.
+        const std::vector<float> shortRight(32, -0.5f);
+        dsp::assignMeasurementAndReference(0, left, shortRight, meas, ref);
+        require(meas.size() == ref.size() && meas.size() == shortRight.size(),
+                "A short second channel must be trimmed so both stay the same length");
+    }
+
+    // ---- Output channel separation ----
+    // Feeding one output side only is what makes the reference usable: the amplifier is
+    // driven from one channel while the other stays silent, so the loopback tap and the
+    // microphone do not both hear the generator straight from the interface.
+    {
+        auto peakOf = [] (const std::vector<float>& block)
+        {
+            float peak = 0.0f;
+
+            for (const auto value : block)
+                peak = std::max(peak, std::abs(value));
+
+            return peak;
+        };
+
+        auto silent = [&peakOf] (const std::vector<float>& block)
+        {
+            return peakOf (block) == 0.0f;
+        };
+
+        std::vector<float> left(1024, 0.0f), right(1024, 0.0f);
+        float* outputs[] = { left.data(), right.data() };
+
+        engine.setGeneratorRouting (AudioEngine::OutputRouting::Left);
+
+        for (int i = 0; i < 1024; ++i)
+            left[(size_t) i] = right[(size_t) i] = 0.5f;
+
+        engine.audioDeviceIOCallbackWithContext (inputs, 1, outputs, 2, 1024, context);
+        require (peakOf (left) > 0.0f, "Routing to the left must keep the signal on the left");
+        require (silent (right), "Routing to the left must silence the right output");
+
+        std::vector<float> generatedLeft;
+        engine.getGeneratorOutput (generatedLeft);
+        require (! generatedLeft.empty() && peakOf (generatedLeft) > 0.0f,
+                 "The captured reference must still carry the signal when routed left");
+
+        engine.setGeneratorRouting (AudioEngine::OutputRouting::Right);
+
+        for (int i = 0; i < 1024; ++i)
+            left[(size_t) i] = right[(size_t) i] = 0.5f;
+
+        engine.audioDeviceIOCallbackWithContext (inputs, 1, outputs, 2, 1024, context);
+        require (silent (left), "Routing to the right must silence the left output");
+        require (peakOf (right) > 0.0f, "Routing to the right must keep the signal on the right");
+
+        // The captured reference follows the routed channel, otherwise the delay and
+        // transfer function would compare against silence.
+        std::vector<float> generatedRight;
+        engine.getGeneratorOutput (generatedRight);
+        require (! generatedRight.empty() && peakOf (generatedRight) > 0.0f,
+                 "The captured reference must follow the routed output channel");
+
+        engine.setGeneratorRouting (AudioEngine::OutputRouting::Both);
+
+        for (int i = 0; i < 1024; ++i)
+            left[(size_t) i] = right[(size_t) i] = 0.5f;
+
+        engine.audioDeviceIOCallbackWithContext (inputs, 1, outputs, 2, 1024, context);
+        require (left == right, "Both sides must be identical again when both are routed");
+
+        // A mono device has no side to pick, so it always carries the signal.
+        engine.setGeneratorRouting (AudioEngine::OutputRouting::Right);
+        std::vector<float> mono (1024, 0.0f);
+        float* monoOutput[] = { mono.data() };
+        engine.audioDeviceIOCallbackWithContext (inputs, 1, monoOutput, 1, 1024, context);
+        require (peakOf (mono) > 0.0f, "A mono output must always carry the generator");
+
+        engine.setGeneratorRouting (AudioEngine::OutputRouting::Both);
+    }
+
     AudioEngine listing;
 
     const auto labels = listing.getOutputDeviceLabels();
@@ -810,6 +934,191 @@ int main()
         generator.setRunning (false);
     }
 
+    // ---- Pink noise driver bands ----
+    // Room correction is done one driver at a time, so the band has to be selectable by
+    // name: subwoofer, woofer, midrange, tweeter, plus the full band.
+    {
+        const auto presets = SignalGenerator::getBandPresets();
+        require (presets.size() == 5, "There must be a pink noise band per driver plus the full band");
+
+        const std::array<juce::String, 4> drivers = { "Subwoofer", "Woofer", "Midrange", "Tweeter" };
+
+        for (size_t i = 0; i < drivers.size(); ++i)
+        {
+            require (presets[i].name.contains (drivers[i]),
+                     "Each driver band must be named after its driver");
+            require (presets[i].name.contains (juce::String ((double) presets[i].lowFrequency, 0) + " ")
+                     && presets[i].name.contains ("- " + juce::String ((double) presets[i].highFrequency, 0)),
+                     "Each driver band must state both of its edges in the name");
+            require (presets[i].lowFrequency >= 10.0f && presets[i].lowFrequency <= 2000.0f,
+                     "A driver band floor must sit inside the range the generator accepts");
+            require (presets[i].highFrequency >= presets[i].lowFrequency * 2.0f
+                     && presets[i].highFrequency <= 20000.0f,
+                     "A driver band must span at least an octave and stay under Nyquist");
+        }
+
+        require (presets[0].lowFrequency < presets[1].lowFrequency
+                 && presets[1].lowFrequency < presets[2].lowFrequency
+                 && presets[2].lowFrequency < presets[3].lowFrequency,
+                 "Driver bands must run from the subwoofer up to the tweeter");
+
+        // The bands must not overlap, or a driver would be excited by two presets at once.
+        for (size_t i = 0; i + 1 < drivers.size(); ++i)
+            require (presets[i].highFrequency <= presets[i + 1].lowFrequency,
+                     "Neighbouring driver bands must meet without overlapping");
+
+        require (presets[4].name.contains ("Full")
+                 && std::abs (presets[4].lowFrequency - 20.0f) < 0.01f
+                 && std::abs (presets[4].highFrequency - 20000.0f) < 0.01f,
+                 "The full band must cover 20 Hz to 20 kHz");
+
+        // Every preset must be recognised, and a hand set band must not be.
+        SignalGenerator generator;
+        generator.prepare (rate);
+
+        for (int i = 0; i < presets.size(); ++i)
+        {
+            require (SignalGenerator::findBandPreset (presets[i].lowFrequency,
+                                                      presets[i].highFrequency) == i,
+                     "Each driver band must be found by its own limits");
+
+            generator.setBandLimits (presets[i].lowFrequency, presets[i].highFrequency);
+            require (std::abs (generator.getBandLow() - presets[i].lowFrequency) < 0.5f
+                     && std::abs (generator.getBandHigh() - presets[i].highFrequency) < 0.5f,
+                     "A driver band must be applied exactly, without being clamped");
+
+            // The plot has to zoom onto the band, or the display still ignores the choice.
+            const auto view = dsp::generatorViewRange ("Pink Noise", generator.getBandLow(),
+                                                       generator.getBandHigh(), 1000.0f, 20.0f, 20000.0f);
+            require (view.low <= presets[i].lowFrequency && view.high >= presets[i].highFrequency,
+                     "The spectrum axis must cover the whole selected driver band");
+
+            // The full band is the one case where the axis should stay at 20 Hz - 20 kHz.
+            if (i < drivers.size())
+                require (view.high / view.low < presets[4].highFrequency / presets[4].lowFrequency,
+                         "A driver band must zoom the axis in instead of using the full range");
+        }
+
+        require (SignalGenerator::findBandPreset (333.0f, 777.0f) == -1,
+                 "A hand set band must not be reported as a driver preset");
+
+        // And the signal itself must land in the band, not just the numbers: the tweeter
+        // band has to leave the bass almost silent, or boosting it would move a subwoofer.
+        generator.setBandLimits (presets[3].lowFrequency, presets[3].highFrequency);
+        generator.setRunning (true);
+
+        std::vector<float> tweeterBlock (size * 4);
+
+        for (int block = 0; block < 4; ++block)
+            generator.process (tweeterBlock.data() + (size_t) block * size, size);
+
+        generator.setRunning (false);
+
+        dsp::BlockAnalyser bandAnalyser;
+        bandAnalyser.prepare (rate, size);
+
+        dsp::Spectrum tweeterSpectrum;
+        bandAnalyser.analyse (tweeterBlock.data(), tweeterSpectrum);
+
+        double inBand = 0.0, belowBand = 0.0;
+
+        for (size_t i = 0; i < tweeterSpectrum.freq.size(); ++i)
+        {
+            const auto power = std::pow (10.0, tweeterSpectrum.magnitudeDb[i] / 10.0);
+
+            if (tweeterSpectrum.freq[i] >= 2000.0f) inBand += power;
+            else if (tweeterSpectrum.freq[i] >= 500.0f) belowBand += power;
+        }
+
+        require (inBand > belowBand * 20.0,
+                 "The tweeter band must put most of its power above 2 kHz");
+
+        generator.setBandLimits (20.0f, 20000.0f);
+    }
+
+    // ---- Generator spectrum follows the settings ----
+    // The generator plot must zoom onto what is configured. On a fixed 20 Hz - 20 kHz
+    // axis a tone, or a narrow pink noise band, collapses into a single pixel and the
+    // display looks like it is ignoring the settings.
+    {
+        // Type names come from the generator itself, so a renamed selector cannot leave
+        // the plot matching on a string that no longer exists.
+        const auto types = SignalGenerator::getTypeNames();
+        require (types.size() == 4, "The generator must still expose four signal types");
+
+        const auto pink = dsp::generatorViewRange (types[0], 20.0f, 20000.0f,
+                                                    1000.0f, 20.0f, 20000.0f);
+        require (std::abs (pink.low - 20.0f) < 0.01f && std::abs (pink.high - 20000.0f) < 0.5f,
+                 "A full band pink noise must keep the default 20 Hz - 20 kHz axis");
+
+        const auto narrowed = dsp::generatorViewRange (types[0], 500.0f, 2000.0f,
+                                                       1000.0f, 20.0f, 20000.0f);
+        require (narrowed.low < 500.0f && narrowed.high > 2000.0f,
+                 "A narrowed pink noise band must still be visible with its edges in view");
+        require (narrowed.high / narrowed.low <= 20.0f,
+                 "A narrow band must zoom in, not stay on the full 20 Hz - 20 kHz axis");
+
+        const auto tone = dsp::generatorViewRange (types[2], 20.0f, 20000.0f,
+                                                   997.0f, 20.0f, 20000.0f);
+        require (tone.low < 997.0f && tone.high > 997.0f,
+                 "A tone must sit inside the visible axis");
+        require (tone.high / tone.low >= 1.8f && tone.high / tone.low <= 4.2f,
+                 "A tone must be shown with about an octave of context each side");
+
+        const auto sweep = dsp::generatorViewRange (types[3], 20.0f, 20000.0f,
+                                                    1000.0f, 100.0f, 10000.0f);
+        require (sweep.low <= 100.0f && sweep.high >= 10000.0f,
+                 "The sweep axis must cover the configured sweep range");
+
+        // White noise is not band limited, so the pink noise band must not narrow its axis.
+        const auto white = dsp::generatorViewRange (types[1], 500.0f, 2000.0f,
+                                                    997.0f, 100.0f, 10000.0f);
+        require (std::abs (white.low - 20.0f) < 0.01f && std::abs (white.high - 20000.0f) < 0.5f,
+                 "White noise must keep the full axis, since its band setting does not limit it");
+
+        // A zoomed tone at 20 kHz must not run off the top of the plot.
+        const auto topTone = dsp::generatorViewRange (types[2], 20.0f, 20000.0f,
+                                                      20000.0f, 20.0f, 20000.0f);
+        require (topTone.high <= 48000.0f && topTone.high > 20000.0f,
+                 "A top end tone must stay inside the plotted axis");
+        require (topTone.low < 20000.0f,
+                 "A top end tone must not collapse to the right edge");
+
+        // Nonsense or inverted settings must fall back to the full band instead of
+        // producing a broken axis.
+        const auto broken = dsp::generatorViewRange (types[0], 0.0f, -5.0f,
+                                                     1000.0f, 20000.0f, 20.0f);
+        require (std::abs (broken.low - 20.0f) < 0.01f && std::abs (broken.high - 20000.0f) < 0.5f,
+                 "An invalid band must fall back to the full frequency axis");
+
+        // Axis ticks: round 1-2-5 values inside the view, always inside it, and never
+        // more than the plot width can label.
+        for (const auto range : { pink, narrowed, tone, sweep, topTone })
+        {
+            const auto ticks = dsp::logAxisTicks (range.low, range.high, 8);
+            require (! ticks.empty(), "Every visible range must produce axis ticks");
+
+            for (const auto freq : ticks)
+                require (freq >= range.low && freq <= range.high,
+                         "Axis ticks must stay inside the visible range");
+
+            require ((int) ticks.size() <= 8,
+                     "Axis ticks must be thinned to fit the plot width");
+
+            auto sorted = ticks;
+            std::sort (sorted.begin(), sorted.end());
+            require (sorted == ticks, "Axis ticks must run in increasing order");
+        }
+
+        require (dsp::logAxisTicks (20000.0f, 20.0f, 8).empty(),
+                 "An inverted axis must produce no ticks instead of garbage");
+        require (dsp::frequencyTickLabel (20.0f) == "20"
+                 && dsp::frequencyTickLabel (997.0f) == "997"
+                 && dsp::frequencyTickLabel (1000.0f) == "1k"
+                 && dsp::frequencyTickLabel (20000.0f) == "20k",
+                 "Axis labels must read as round frequencies with a k suffix above 1 kHz");
+    }
+
     // ---- Manual generator frequency ----
     // A typed frequency has to survive unchanged: measurement work needs 997 Hz to
     // stay 997 Hz, not be rounded to the nearest slider step.
@@ -906,6 +1215,176 @@ int main()
         require(FrequencyLabels::width() > 0.0f, "The label box width must stay positive");
     }
 
+    // ---- Transfer function coherence ----
+    // Coherence is only defined where the reference actually carries signal. A band
+    // limited source leaves most of the spectrum empty, and dividing the cross spectrum
+    // by two near-zero powers there reports a confident 1.0, which reads as a perfect
+    // measurement over a band that was never excited.
+    {
+        constexpr int tfFft = 16384;
+        constexpr int tfLag = 256;
+
+        const auto binNear = [&] (const std::vector<float>& freq, float target)
+        {
+            size_t best = 0;
+
+            for (size_t i = 0; i < freq.size(); ++i)
+                if (std::abs (freq[i] - target) < std::abs (freq[best] - target))
+                    best = i;
+
+            return best;
+        };
+
+        // Reference band limited to 500 Hz - 2 kHz, measurement delayed by 256 samples
+        // and scaled by 0.5, which is -6.02 dB of gain.
+        SignalGenerator source;
+        source.prepare (rate);
+        source.setType (SignalGenerator::Type::Pink);
+        source.setBandLimits (500.0f, 2000.0f);
+        source.setRunning (true);
+
+        // Fresh realisations per frame, because averaging the same block again would
+        // repeat one estimate instead of converging on it.
+        constexpr int frames = 16;
+        std::vector<std::vector<float>> tfRefs (frames), tfMeasAll (frames);
+        std::mt19937 rng (7);
+        std::normal_distribution<float> noise (0.0f, 0.001f);
+
+        for (int frame = 0; frame < frames; ++frame)
+        {
+            auto& block = tfRefs[(size_t) frame];
+            auto& measuredBlock = tfMeasAll[(size_t) frame];
+            block.assign (tfFft, 0.0f);
+            measuredBlock.assign (tfFft, 0.0f);
+
+            for (int i = 0; i < tfFft; ++i)
+                source.process (block.data() + i, 1);
+
+            for (int i = 0; i < tfFft; ++i)
+                measuredBlock[(size_t) i] = block[(size_t) i] * 0.5f + noise (rng);
+
+            // Shift the measurement so it arrives 256 samples late, as a real path does.
+            for (int i = tfFft - 1; i >= tfLag; --i)
+                measuredBlock[(size_t) i] = block[(size_t) (i - tfLag)] * 0.5f + noise (rng);
+
+            for (int i = 0; i < tfLag; ++i)
+                measuredBlock[(size_t) i] = 0.0f;
+        }
+
+        const auto& tfRef = tfRefs[0];
+        const auto& tfMeas = tfMeasAll[0];
+
+        TransferFunction tf;
+        tf.prepare (rate, tfFft);
+        tf.setAveraging (16);
+        tf.setAutomaticDelay (false);
+
+        TransferFunction::Result measured;
+
+        for (int frame = 0; frame < frames; ++frame)
+            measured = tf.process (tfRefs[(size_t) frame].data(),
+                                   tfMeasAll[(size_t) frame].data(), tfFft);
+
+        // The plot smoothes over a third of an octave, so the check reads the same curve
+        // the user sees rather than one raw FFT bin.
+        std::vector<float> smoothed;
+        dsp::smoothMagnitudeDb (measured.freq, measured.magnitudeDb, 3, smoothed);
+
+        require (measured.valid, "A transfer function must be produced from two channels");
+        require (measured.binValid.size() == measured.freq.size(),
+                 "Every bin must report whether it can be measured");
+
+        const auto lowBin = binNear (measured.freq, 125.0f);
+        const auto midBin = binNear (measured.freq, 1000.0f);
+        const auto highBin = binNear (measured.freq, 8000.0f);
+
+        require (! measured.binValid[(size_t) lowBin] && ! measured.binValid[(size_t) highBin],
+                 "Bins outside the excited band must be blanked, not measured");
+        require (measured.coherence[(size_t) lowBin] == 0.0f
+                 && measured.coherence[(size_t) highBin] == 0.0f,
+                 "A blanked bin must not report a coherence");
+        require (measured.magnitudeDb[(size_t) lowBin] <= dsp::dbFloor + 0.5f,
+                 "A blanked bin must not report a magnitude");
+        require (measured.blankedBins > measured.validBins,
+                 "Most of the spectrum is outside a 500 Hz - 2 kHz source and must be blanked");
+
+        require (measured.binValid[(size_t) midBin],
+                 "A bin inside the excited band must be measurable");
+        require (std::abs (smoothed[midBin] + 6.02f) < 0.3f,
+                 "The transfer function must report the gain of the measured path");
+        require (measured.coherence[(size_t) midBin] > 0.9f,
+                 "Coherence must be high where the measurement carries the same signal");
+        require (measured.averageCoherence > 0.9f,
+                 "The average coherence must follow the excited band, not the empty bins");
+
+        // The delay finder must find the injected lag, which is what makes the phase and
+        // the impulse response line up.
+        TransferFunction delayed;
+        delayed.prepare (rate, tfFft);
+        delayed.setAutomaticDelay (false);
+        const auto found = delayed.findDelay (tfRef.data(), tfMeas.data());
+        require (std::abs (found - (float) tfLag) < 2.0f,
+                 "Find Delay must locate the injected lag in samples");
+        require (std::abs (delayed.getDelayMs() - 1000.0f * tfLag / rate) < 0.1f,
+                 "The delay must also be reported in milliseconds");
+
+        // Coherence has to fall when the measurement is mostly noise, or the reading
+        // means nothing.
+        std::vector<float> noisyMeas (tfFft);
+
+        for (int i = 0; i < tfFft; ++i)
+            noisyMeas[(size_t) i] = noise (rng) * 3.0f;
+
+        TransferFunction noisy;
+        noisy.prepare (rate, tfFft);
+        noisy.setAveraging (16);
+        noisy.setAutomaticDelay (false);
+
+        TransferFunction::Result noisyResult;
+
+        for (int frame = 0; frame < frames; ++frame)
+            noisyResult = noisy.process (tfRefs[(size_t) frame].data(), noisyMeas.data(), tfFft);
+
+        require (noisyResult.averageCoherence < measured.averageCoherence - 0.2f,
+                 "Coherence must collapse when the measurement carries no signal");
+
+        // A silent reference must report nothing at all, never a perfect score.
+        std::vector<float> silence (tfFft, 0.0f);
+        TransferFunction quiet;
+        quiet.prepare (rate, tfFft);
+        quiet.setAveraging (8);
+        quiet.setAutomaticDelay (false);
+
+        TransferFunction::Result quietResult;
+
+        for (int frame = 0; frame < 16; ++frame)
+            quietResult = quiet.process (silence.data(), silence.data(), tfFft);
+
+        require (quietResult.validBins == 0 && quietResult.averageCoherence == 0.0f,
+                 "A silent reference must report no measurable bins and no coherence");
+
+        // Blanking is a range below the strongest reference bin, so it has to follow the
+        // level of whatever is being measured.
+        TransferFunction wide;
+        wide.prepare (rate, tfFft);
+        wide.setAveraging (16);
+        wide.setAutomaticDelay (false);
+        wide.setBlankingRangeDb (120.0f);
+
+        TransferFunction::Result wideResult;
+
+        for (int frame = 0; frame < frames; ++frame)
+            wideResult = wide.process (tfRefs[(size_t) frame].data(),
+                                       tfMeasAll[(size_t) frame].data(), tfFft);
+
+        // A wider range keeps more of the faded skirt, but a bin with no reference power
+        // at all stays blanked however wide the range is.
+        require (wideResult.validBins > measured.validBins,
+                 "A wider blanking range must keep more of the band edge");
+        require (wideResult.validBins < (int) wideResult.freq.size(),
+                 "A bin with no reference power must stay blanked at any range");
+    }
+
     std::cout << "PASS: paired pink noise, stereo copies, mono microphone delay 64 ms, silence rejection, 31 bands\n";
     std::cout << "PASS: 100-bar linear RTA centres 119.9-19900 Hz, 1500 Hz tone detection, DC rejected\n";
     std::cout << "PASS: frequency labels are bold, sized for the row, and all 31 fit at 1/3 octave\n";
@@ -913,6 +1392,11 @@ int main()
     std::cout << "PASS: typed generator frequencies are applied exactly and out-of-range values clamp\n";
     std::cout << "PASS: pink noise puts 95%+ of its power inside 20 Hz - 20 kHz and keeps its tilt\n";
     std::cout << "PASS: both pink noise band limits are adjustable and the signal follows them\n";
+    std::cout << "PASS: pink noise has a selectable band per driver, subwoofer to tweeter\n";
+    std::cout << "PASS: output channel separation keeps the reference on the routed side\n";
+    std::cout << "PASS: measurement and reference are picked from left and right by their assignment\n";
+    std::cout << "PASS: coherence blanks unexcited bins, reports the gain, and Find Delay locates the lag\n";
+    std::cout << "PASS: generator spectrum axis zooms onto the configured tone, sweep and pink band\n";
     std::cout << "PASS: ISO 266 nominal 1/3 octave table exact; 1/1..1/12 octave counts 11/21/31/41/61/121 strictly increasing\n";
     std::cout << "PASS: bars tile 20 Hz to 20 kHz with no clipping and every centre inside its bar\n";
     std::cout << "PASS: octave bands reject DC offset while keeping the floor level\n";

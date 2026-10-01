@@ -39,16 +39,45 @@ load.
   - Peak
   - Leq
   - Calibration offset
+- Channel assignment
+  - Measurement and reference are assigned to the left and right input separately, so a
+    microphone on one input and a loopback tap on the other is a normal wiring
+  - The generator can feed one output side only, leaving the other silent
+  - The plot legend names the channel behind each trace
 - Signal generator
   - Pink noise
   - White noise
   - Sine
   - Sweep
+  - Driver bands for pink noise: subwoofer, woofer, midrange, tweeter, or the full
+    20 Hz - 20 kHz band. Room correction is done one driver at a time, because
+    coherence and level are only meaningful inside the band a driver reproduces
+  - Output side: left, right or both, so an amplifier can be fed from one output while
+    the reference tap stays separate
+  - Frequency and both band limits can be typed exactly, next to their sliders
+  - The spectrum plot follows the settings: the axis zooms onto the selected band,
+    tone or sweep range, the band edges are shaded, and a sweep shows where it is
+
+### Transfer Function tab
+
+- Magnitude, phase and coherence of one dual channel measurement, stacked on a shared
+  frequency axis
+- Coherence is computed only where the reference carries signal. Bins outside the
+  excited band are blanked, because their coherence is the ratio of two near-zero
+  powers and used to read as a confident 100 %
+- The average coherence is weighted by reference power, so it describes the band being
+  measured instead of being averaged over the whole axis
+- A validity line at 80 % coherence, because below that the measurement is not usable
+  however good the curve looks
+- **Cari Delay** searches for the first impulse peak once and restarts the averages, so
+  every averaged frame shares one delay compensation
+- Coherent regions are smoothed over a third of an octave, matching the rest of the app
 
 ### RTA display
 
 - Two styles: octave bands, or 100 evenly spaced bars on a linear frequency axis
 - Band resolution from 1/1 octave up to 1/12 octave
+- Transfer function and coherence traces break where the reference carried no signal
 - Band centres follow the ISO 266 nominal frequency table (20 Hz, 25, 31.5, 40, …)
 - Every band is labelled with its frequency
 - Bars tile the plot exactly: no gaps, no clipping at 20 Hz or 20 kHz
@@ -127,8 +156,11 @@ ctest --output-on-failure
 ```
 
 `audio_checks` covers the DSP path: pink-noise coherence, channel copy, delay
-detection, band tables, DC rejection, calibration parsing, and the snapshot round
-trip. `ui_checks` exists but needs the GTK headers mentioned above.
+detection, driver band presets, band tables, DC rejection, calibration parsing, and
+the snapshot round trip. `ui_checks` renders the panels to PNG and checks the
+generator controls, including that a driver band reaches the generator and that a
+hand set band reports itself as manual. Both run under `xvfb-run`, since the checks
+need a display server for the GUI target.
 
 Python:
 
