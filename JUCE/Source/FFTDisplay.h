@@ -54,9 +54,17 @@ public:
     void setStyle(Style newStyle);
     Style getStyle() const { return style; }
 
-    /** Level history, for the spectrogram view. Zero until the first frame arrives. */
-    int getSpectrogramColumns() const { return spectrogramColumns; }
-    int getSpectrogramRows() const { return spectrogramRows; }
+    /** History size for the spectrogram view: bands across, frames up. Zero until the
+        first frame arrives. */
+    int getSpectrogramBands() const { return spectrogramBands; }
+    int getSpectrogramFrames() const { return spectrogramFrames; }
+
+    /** Level recorded a number of frames ago, 0 being the newest. Lets the checks confirm
+        the history is stored newest at the bottom without measuring pixels. */
+    float getSpectrogramHistoryDb(int framesAgo, int band) const;
+
+    /** Where the history is drawn, so the checks can look at the picture itself. */
+    juce::Rectangle<int> getSpectrogramBounds() const { return plotArea().toNearestInt(); }
 
     void setBandOctaveFraction(int fraction);
     int getBandOctaveFraction() const { return bandOctaveFraction; }
@@ -150,20 +158,22 @@ private:
     void updatePeakHold();
     juce::Rectangle<float> plotArea() const;
     float minimumLabelSpacing(const juce::Rectangle<float>& area) const;
-    /** One history column: the level per log spaced frequency band, as colours.
+    /** One frame of history, drawn as a row along the bottom.
 
-        The rows are log spaced rather than per FFT bin, so the image is as tall as it is
-        useful and lines up with the log frequency axis of the other views. Averaging
-        rather than taking the peak keeps a single loud bin from painting a whole band.
+        Time runs upwards, the way a paper recorder leaves a trace: the newest frame is
+        at the bottom and the past moves up, instead of the picture scrolling sideways
+        away from the frequency axis. Bands are log spaced rather than per FFT bin, so
+        they line up with the log frequency axis of the other views, and averaged rather
+        than peaked so a single loud bin cannot paint a whole band.
     */
-    void pushSpectrogramColumn(const Frame& frame);
+    void pushSpectrogramFrame(const Frame& frame);
     void resetSpectrogram();
     void ensureSpectrogramSize();
     void syncSpectrogramRange() const;
     void recolourSpectrogram() const;
     juce::Colour spectrogramColourFor(float db) const;
-    float spectrogramBandLevel(const Frame& frame, int row) const;
-    float rowFrequency(int row) const;
+    float spectrogramBandLevel(const Frame& frame, int band) const;
+    float bandFrequency(int band) const;
     void drawSpectrogram(juce::Graphics& g, const juce::Rectangle<float>& area) const;
     float frequencyToX(float freq, const juce::Rectangle<float>& area) const;
     float valueToY(float value, const juce::Rectangle<float>& area) const;
@@ -252,8 +262,8 @@ private:
         changes without waiting for new data to arrive. */
     std::vector<float> historyDb;
     int historyHead = 0;
-    int spectrogramRows = 0;
-    int spectrogramColumns = 0;
+    int spectrogramBands = 0;
+    int spectrogramFrames = 0;
     mutable float spectrogramTopDb = 0.0f;
     mutable float spectrogramBottomDb = 0.0f;
 

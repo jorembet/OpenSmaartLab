@@ -71,14 +71,18 @@ per-driver generator bands and separate left/right channel assignment.
 
 ![Spectrogram](docs/spectrogram.png)
 
-- Level history scrolling to the left, one column per frame of live data, so the time
-  axis is real measurement time rather than the refresh rate of the window
+- Level history scrolling **upwards**, one row per frame of live data: the newest frame
+  sits along the bottom, next to the frequency axis, and the past moves up, the way a
+  paper recorder leaves a trace. The time axis is real measurement time rather than the
+  refresh rate of the window
 - Log spaced frequency bands, matching the frequency axis of the other views, averaged
   per band so one loud FFT bin cannot paint a whole band
 - Heat scale with the decibel range printed on it, following the same display range
   selector as the axes: changing the range recolours the history that is already on
   screen
 - A band that has not been excited stays cold instead of being drawn as a low band
+- The colour scale stands in the label column, with the decibel range on it, and the
+  frequency axis runs along the bottom
 - Freeze stops the scroll; leaving the view drops the history, so its time axis cannot
   silently continue from a moment the user had already left
 

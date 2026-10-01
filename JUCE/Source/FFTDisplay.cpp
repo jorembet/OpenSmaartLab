@@ -480,7 +480,7 @@ void FFTDisplay::pushData(const std::vector<float>& freq,
     // One column per frame of live data, so the time axis is real time and not the
     // refresh rate of the window.
     if (style == Style::Spectrogram)
-        pushSpectrogramColumn(current);
+        pushSpectrogramFrame(current);
 
     // Only the microphone channel is calibrated. The reference channel is usually a
     // loopback of the generator, so correcting it would break the transfer function.
@@ -872,9 +872,10 @@ void FFTDisplay::paint(juce::Graphics& g)
     }
 }
 
-float FFTDisplay::rowFrequency(int row) const
+float FFTDisplay::bandFrequency(int band) const
 {
-    const auto fraction = juce::jlimit(0.0f, 1.0f, (float) row / (float) (spectrogramRows - 1));
+    const auto bands = juce::jmax(1, spectrogramBands);
+    const auto fraction = juce::jlimit(0.0f, 1.0f, (float) band / (float) (bands - 1));
     return minFrequency * std::pow(maxFrequency / minFrequency, fraction);
 }
 
@@ -914,13 +915,13 @@ juce::Colour FFTDisplay::spectrogramColourFor(float db) const
     return ramp[std::size(ramp) - 1].colour;
 }
 
-float FFTDisplay::spectrogramBandLevel(const Frame& frame, int row) const
+float FFTDisplay::spectrogramBandLevel(const Frame& frame, int band) const
 {
     if (frame.measDb.empty() || frame.freq.empty())
         return dsp::dbFloor;
 
-    const auto low = rowFrequency(row);
-    const auto high = rowFrequency(row + 1);
+    const auto low = bandFrequency(band);
+    const auto high = bandFrequency(band + 1);
     double total = 0.0;
     auto count = 0;
 
@@ -945,27 +946,41 @@ void FFTDisplay::resetSpectrogram()
 {
     spectrogramFront = {};
     spectrogramBack = {};
-    spectrogramRows = 0;
-    spectrogramColumns = 0;
+    spectrogramBands = 0;
+    spectrogramFrames = 0;
     repaint();
+}
+
+float FFTDisplay::getSpectrogramHistoryDb(int framesAgo, int band) const
+{
+    if (historyDb.empty() || band < 0 || band >= spectrogramBands
+        || framesAgo < 0 || framesAgo >= spectrogramFrames)
+        return dsp::dbFloor;
+
+    const auto frame = ((historyHead - 1 - framesAgo) % spectrogramFrames
+                        + spectrogramFrames) % spectrogramFrames;
+
+    return historyDb[(size_t) frame * (size_t) spectrogramBands + (size_t) band];
 }
 
 void FFTDisplay::ensureSpectrogramSize()
 {
+    // Bands run across the frequency axis and frames up the time axis, so both
+    // dimensions are the size of the plot and the picture is blitted one to one.
     const auto plot = plotArea().toNearestInt();
-    const auto columns = juce::jlimit(120, 1600, plot.getWidth());
-    const auto rows = juce::jlimit(64, 800, plot.getHeight());
+    const auto bands = juce::jlimit(120, 1600, plot.getWidth());
+    const auto frames = juce::jlimit(64, 700, plot.getHeight());
 
-    if (spectrogramFront.isValid() && spectrogramColumns == columns && spectrogramRows == rows)
+    if (spectrogramFront.isValid() && spectrogramBands == bands && spectrogramFrames == frames)
         return;
 
     resetSpectrogram();
 
-    spectrogramColumns = columns;
-    spectrogramRows = rows;
-    historyDb.assign((size_t) columns * (size_t) rows, dsp::dbFloor);
-    spectrogramFront = juce::Image(juce::Image::ARGB, spectrogramColumns, spectrogramRows, true);
-    spectrogramBack = juce::Image(juce::Image::ARGB, spectrogramColumns, spectrogramRows, true);
+    spectrogramBands = bands;
+    spectrogramFrames = frames;
+    historyDb.assign((size_t) bands * (size_t) frames, dsp::dbFloor);
+    spectrogramFront = juce::Image(juce::Image::ARGB, spectrogramBands, spectrogramFrames, true);
+    spectrogramBack = juce::Image(juce::Image::ARGB, spectrogramBands, spectrogramFrames, true);
 
     // Starting from the floor colour rather than transparent black keeps a band that has
     // not been excited visibly cold instead of showing the panel through.
@@ -997,13 +1012,16 @@ void FFTDisplay::recolourSpectrogram() const
     if (! spectrogramFront.isValid() || historyDb.empty())
         return;
 
-    for (int x = 0; x < spectrogramColumns; ++x)
+    // Repainted from the oldest frame at the top to the newest at the bottom, matching
+    // the order the incremental writer produces.
+    for (int y = 0; y < spectrogramFrames; ++y)
     {
-        const auto sourceColumn = (historyHead + x) % spectrogramColumns;
+        const auto sourceFrame = ((historyHead - spectrogramFrames + y) % spectrogramFrames
+                                  + spectrogramFrames) % spectrogramFrames;
 
-        for (int y = 0; y < spectrogramRows; ++y)
+        for (int x = 0; x < spectrogramBands; ++x)
         {
-            const auto db = historyDb[(size_t) sourceColumn * (size_t) spectrogramRows + (size_t) y];
+            const auto db = historyDb[(size_t) sourceFrame * (size_t) spectrogramBands + (size_t) x];
             spectrogramFront.setPixelAt(x, y, spectrogramColourFor(db));
         }
     }
@@ -1012,80 +1030,92 @@ void FFTDisplay::recolourSpectrogram() const
     g.drawImageAt(spectrogramFront, 0, 0);
 }
 
-void FFTDisplay::pushSpectrogramColumn(const Frame& frame)
+void FFTDisplay::pushSpectrogramFrame(const Frame& frame)
 {
     ensureSpectrogramSize();
 
     if (! spectrogramFront.isValid())
         return;
 
-    // Shift left one column and draw the new one at the right edge. The blit goes to the
+    // Shift up one row and draw the new frame along the bottom, so the past moves up and
+    // the newest measurement stays where the frequency axis is. The blit goes to the
     // second image, because an image cannot be drawn onto itself.
     {
         juce::Graphics g(spectrogramBack);
-        g.drawImageAt(spectrogramFront, -1, 0);
+        g.drawImageAt(spectrogramFront, 0, -1);
     }
 
-    for (int row = 0; row < spectrogramRows; ++row)
+    for (int band = 0; band < spectrogramBands; ++band)
     {
-        // Row 0 is 20 Hz and has to stay at the bottom of the picture, so the row index is
-        // flipped: the image is drawn top down while frequency runs upwards.
-        const auto level = spectrogramBandLevel(frame, spectrogramRows - 1 - row);
+        const auto level = spectrogramBandLevel(frame, band);
 
-        historyDb[(size_t) historyHead * (size_t) spectrogramRows + (size_t) row] = level;
-        spectrogramBack.setPixelAt(spectrogramColumns - 1, row, spectrogramColourFor(level));
+        historyDb[(size_t) historyHead * (size_t) spectrogramBands + (size_t) band] = level;
+        spectrogramBack.setPixelAt(band, spectrogramFrames - 1, spectrogramColourFor(level));
     }
 
-    historyHead = (historyHead + 1) % spectrogramColumns;
+    historyHead = (historyHead + 1) % spectrogramFrames;
     std::swap(spectrogramFront, spectrogramBack);
     repaint();
 }
 
-void FFTDisplay::drawSpectrogram(juce::Graphics& g, const juce::Rectangle<float>& plotArea) const
+void FFTDisplay::drawSpectrogram(juce::Graphics& g, const juce::Rectangle<float>& area) const
 {
-    auto area = plotArea;
-
     g.setColour(panelColour);
     g.fillRect(area);
+
+    const auto ticks = dsp::logAxisTicks(minFrequency, maxFrequency,
+                                         std::max (2, (int) (area.getWidth() / 62.0f)));
+
+    // The frequency grid goes down first: those lines mark the axis, they are not part of
+    // the measurement, and a line drawn over the history would read as a signal.
+    for (const auto frequency : ticks)
+    {
+        g.setColour(gridBoldColour.withAlpha(0.35f));
+        g.drawVerticalLine(juce::roundToInt(frequencyToX(frequency, area)),
+                           area.getY(), area.getBottom());
+    }
 
     syncSpectrogramRange();
 
     if (spectrogramFront.isValid())
         g.drawImageAt(spectrogramFront, area.getX(), area.getY());
 
-    // A colour scale carrying the dB range, because a heat map without one is a picture
-    // rather than a measurement. It sits along the top, where the history is empty while
-    // a measurement starts.
-    const auto scaleRect = juce::Rectangle<float>(area.getX() + 8.0f, area.getY() + 8.0f,
-                                                  150.0f, 12.0f);
+    // The colour scale lives in the label column, because the time axis now owns the
+    // vertical space inside the plot and a heat map without a scale is only a picture.
+    const auto scaleRect = juce::Rectangle<float>(area.getX() - 42.0f, area.getY(),
+                                                  11.0f, area.getHeight());
 
-    // Cold on the left, hot on the right, to match the labels underneath it.
-    for (int x = 0; x < (int) scaleRect.getWidth(); ++x)
+    for (int y = 0; y < (int) scaleRect.getHeight(); ++y)
     {
-        const auto db = bottomDb + (topDb - bottomDb) * (float) x / std::max(1.0f, scaleRect.getWidth() - 1.0f);
+        const auto db = topDb - (bottomDb - topDb) * (float) y
+                                   / std::max (1.0f, scaleRect.getHeight() - 1.0f);
+
         g.setColour(spectrogramColourFor(db));
-        g.drawVerticalLine(juce::roundToInt(scaleRect.getX() + x), scaleRect.getY(),
-                            scaleRect.getBottom());
+        g.drawHorizontalLine(juce::roundToInt(scaleRect.getY() + y), scaleRect.getX(),
+                             scaleRect.getRight());
     }
 
     g.setColour(mutedColour);
-    g.setFont(juce::Font(11.0f));
-    g.drawText(juce::String((int) bottomDb) + " dB", scaleRect.getX(), scaleRect.getBottom() + 2.0f,
-               60.0f, 14.0f, juce::Justification::centredLeft);
-    g.drawText(juce::String((int) topDb) + " dB", scaleRect.getRight() - 60.0f,
-               scaleRect.getBottom() + 2.0f, 60.0f, 14.0f, juce::Justification::centredRight);
+    g.setFont(juce::Font(10.0f));
+    g.drawText(juce::String((int) topDb), scaleRect.getX() - 32.0f, scaleRect.getY() - 7.0f,
+               30.0f, 14.0f, juce::Justification::centredRight);
+    g.drawText(juce::String((int) bottomDb), scaleRect.getX() - 32.0f,
+               scaleRect.getBottom() - 7.0f, 30.0f, 14.0f, juce::Justification::centredRight);
+    g.drawText("dB", scaleRect.getX() - 32.0f, area.getCentreY() - 8.0f, 30.0f, 16.0f,
+               juce::Justification::centredRight);
 
-    // The frequency axis has to be there too, or the history is a picture with no scale
-    // on either axis.
+    // Time runs upwards, so the newest frame is named at the bottom of the plot and the
+    // oldest at the top.
+    g.drawText("lama", scaleRect.getX() - 32.0f, area.getY() + 16.0f, 30.0f, 14.0f,
+               juce::Justification::centredRight);
+    g.drawText("baru", scaleRect.getX() - 32.0f, area.getBottom() - 30.0f, 30.0f, 14.0f,
+               juce::Justification::centredRight);
+
     g.setFont(frequencyLabelFont());
 
-    for (const auto frequency : dsp::logAxisTicks(minFrequency, maxFrequency,
-                                                  std::max (2, (int) (area.getWidth() / 62.0f))))
+    for (const auto frequency : ticks)
     {
         const auto x = frequencyToX(frequency, area);
-
-        g.setColour(gridBoldColour.withAlpha(0.35f));
-        g.drawVerticalLine(juce::roundToInt(x), area.getY(), area.getBottom());
 
         g.setColour(mutedColour);
         const auto labelWidth = frequencyLabelWidth(area);

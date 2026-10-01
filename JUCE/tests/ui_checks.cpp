@@ -368,10 +368,11 @@ int main()
 
         require(spectro.getStyle() == FFTDisplay::Style::Spectrogram,
                 "The spectrogram style must be selectable");
-        require(spectro.getSpectrogramColumns() > 0 && spectro.getSpectrogramRows() > 0,
+        require(spectro.getSpectrogramBands() > 0 && spectro.getSpectrogramFrames() > 0,
                 "The spectrogram must size itself to the plot");
 
-        const auto columns = spectro.getSpectrogramColumns();
+        // Bands run across the frequency axis, frames up the time axis.
+        const auto bands = spectro.getSpectrogramBands();
 
         // A tone that walks up the axis, so the picture has to differ from the cold one.
         for (int frame = 0; frame < 40; ++frame)
@@ -398,9 +399,9 @@ int main()
             spectro.pushData(freq, ref, meas, magnitude, phase, coherence, valid);
         }
 
-        require(spectro.getSpectrogramColumns() == columns,
+        require(spectro.getSpectrogramBands() == bands,
                 "The spectrogram must keep its width as history arrives");
-        require(spectro.getSpectrogramRows() > 0,
+        require(spectro.getSpectrogramFrames() > 0,
                 "The spectrogram must keep its height as history arrives");
 
         const auto beforeRangeChange = spectro.createComponentSnapshot(spectro.getLocalBounds());
@@ -412,6 +413,51 @@ int main()
                 "The display range must be applied exactly as asked");
         const auto afterRangeChange = spectro.createComponentSnapshot(spectro.getLocalBounds());
         require(afterRangeChange.isValid(), "The spectrogram must repaint after a range change");
+
+        // Time runs upwards, so a band that was loud in an earlier frame must still hold
+        // that level further up the history, and the newest frame must be the one read
+        // back as frame zero.
+        const auto bandFor = [&spectro] (float frequency)
+        {
+            auto best = 0;
+            auto closest = std::numeric_limits<float>::max();
+
+            for (int band = 0; band < spectro.getSpectrogramBands(); ++band)
+            {
+                const auto centre = 20.0f * std::pow(1000.0f,
+                                                      (float) band
+                                                          / (float) (spectro.getSpectrogramBands() - 1));
+
+                if (std::abs(centre - frequency) < closest)
+                {
+                    closest = std::abs(centre - frequency);
+                    best = band;
+                }
+            }
+
+            return best;
+        };
+
+        const auto lastFrameTone = bandFor(200.0f * std::pow(2.0f, 39.0f / 12.0f));
+        const auto earlierTone = bandFor(200.0f * std::pow(2.0f, 35.0f / 12.0f));
+
+        require(spectro.getSpectrogramHistoryDb(0, lastFrameTone) > -60.0f,
+                "The newest frame must be stored as frame zero");
+        require(spectro.getSpectrogramHistoryDb(4, earlierTone) > -60.0f,
+                "A frame from four steps ago must still be in the history");
+        require(spectro.getSpectrogramHistoryDb(0, earlierTone) < -100.0f,
+                "An old frame's band must not be reported as the newest measurement");
+
+        // And the picture itself has to agree: the newest frame is the row along the
+        // bottom, with the rows above it older.
+        const auto bounds = spectro.getSpectrogramBounds();
+        // The picture is drawn at the plot's origin, so a band index is an offset into it.
+        const auto column = bounds.getX() + lastFrameTone;
+        const auto newestPixel = afterRangeChange.getPixelAt(column, bounds.getBottom() - 1);
+        const auto topPixel = afterRangeChange.getPixelAt(column, bounds.getY());
+
+        require(newestPixel.getRed() > topPixel.getRed(),
+                "The newest frame must be painted along the bottom of the picture");
 
         // A heat map has to produce many distinct colours; a flat fill would mean the
         // history never reached the picture.
@@ -430,7 +476,7 @@ int main()
         // Back to a bar style the history is dropped, so one view cannot be measured
         // against the other one's time axis.
         spectro.setStyle(FFTDisplay::Style::Bands);
-        require(spectro.getSpectrogramColumns() == 0,
+        require(spectro.getSpectrogramBands() == 0,
                 "Leaving the spectrogram must drop its history");
     }
 
