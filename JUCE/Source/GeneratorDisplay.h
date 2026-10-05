@@ -38,6 +38,9 @@ public:
     /** Third octave averaged level at a frequency, the curve the tilt is measured on. */
     float probeLevelDb(float frequency) const;
 
+    /** FFT window size required to resolve the currently selected low frequency. */
+    int getRequiredSamples() const { return analysisSize; }
+
 private:
     struct Spectrum
     {
@@ -48,6 +51,8 @@ private:
     };
 
     void analyse();
+    void updateAnalysisSize();
+    void prepareAnalysisSize(int size);
     float measureSlope() const;
     void updateSlope();
     juce::Rectangle<float> waveformArea() const;
@@ -78,6 +83,7 @@ private:
     float sweepStart = 20.0f;
     float sweepEnd = 20000.0f;
 
+    int analysisSize = 4096;
     juce::dsp::FFT fft { 12 };
     juce::dsp::WindowingFunction<float> window { 4096, juce::dsp::WindowingFunction<float>::hann, false };
     mutable std::vector<float> scratch;

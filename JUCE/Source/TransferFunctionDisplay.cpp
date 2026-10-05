@@ -2,18 +2,19 @@
 
 namespace
 {
-    const juce::Colour backgroundColour = juce::Colour(0xff111318);
-    const juce::Colour panelColour = juce::Colour(0xff1b1f27);
-    const juce::Colour gridColour = juce::Colour(0xff232833);
-    const juce::Colour gridBoldColour = juce::Colour(0xff39404f);
+    const juce::Colour backgroundColour = juce::Colour(0xff1d1d1d);
+    const juce::Colour panelColour = juce::Colour(0xff262626);
+    const juce::Colour plotColour = juce::Colour(0xff050505);
+    const juce::Colour gridColour = juce::Colour(0xff383838);
+    const juce::Colour gridBoldColour = juce::Colour(0xff555555);
     const juce::Colour textColour = juce::Colour(0xffe6e9ef);
-    const juce::Colour mutedColour = juce::Colour(0xff8892a0);
+    const juce::Colour mutedColour = juce::Colour(0xff9a9a9a);
     const juce::Colour magnitudeColour = juce::Colour(0xffffb74d);
     const juce::Colour phaseColour = juce::Colour(0xff4fc3f7);
     const juce::Colour coherenceColour = juce::Colour(0xff81c784);
     const juce::Colour warningColour = juce::Colour(0xffe53935);
     const juce::Colour validColour = juce::Colour(0xff43a047);
-    const juce::Colour blankedShade = juce::Colour(0xff1a1f29);
+    const juce::Colour blankedShade = juce::Colour(0xff1f1f1f);
 
     constexpr float minFrequency = 20.0f;
     constexpr float maxFrequency = 20000.0f;
@@ -42,6 +43,23 @@ TransferFunctionDisplay::TransferFunctionDisplay()
 
     addAndMakeVisible(findDelayButton);
     addAndMakeVisible(freezeButton);
+    eqOverlayButton.setToggleState(false, juce::dontSendNotification);
+    eqOverlayButton.onClick = [this]
+    {
+        showEqOverlay = eqOverlayButton.getToggleState();
+
+        // The target is derived from the curve, so it has to exist before the first
+        // repaint of a frozen pane, where no further frame is coming to compute it.
+        if (showEqOverlay)
+        {
+            const juce::ScopedLock lock(dataLock);
+            computeEqTarget();
+        }
+
+        repaint();
+    };
+    eqOverlayButton.setTooltip ("Tampilkan kurva koreksi EQ yang meratakan respons");
+    addAndMakeVisible(eqOverlayButton);
     addAndMakeVisible(validityLabel);
     addAndMakeVisible(readoutLabel);
 }
@@ -90,19 +108,46 @@ void TransferFunctionDisplay::pushData(const TransferFunction::Result& result)
     delayMs = result.delayMs;
     averageCoherence = result.averageCoherence;
     peakReferenceDb = result.peakReferenceDb;
+    measRmsDb = result.measRmsDb;
+    measPeakDb = result.measPeakDb;
+    refRmsDb = result.refRmsDb;
+    refPeakDb = result.refPeakDb;
     validBins = result.validBins;
     blankedBins = result.blankedBins;
+    averages = std::max (1, result.averages);
     delayAvailable = !std::isnan(result.delayMs);
 
-    // The validity line is the whole point of the pane: coherence under the threshold
-    // means the measurement is not usable yet, no matter how good the curve looks.
-    const auto usable = validBins > 0 && averageCoherence >= validityThreshold;
-    validityLabel.setColour(juce::Label::textColourId,
-                            usable ? validColour : warningColour);
-    validityLabel.setText(validBins == 0 ? juce::String("Referensi diam - tidak ada yang diukur")
-                                        : (usable ? juce::String("Valid - coherence di atas 80 %")
-                                                  : juce::String("Belum valid - coherence di bawah 80 %")),
-                              juce::dontSendNotification);
+    computeEqTarget();
+
+    // The validity line is the whole point of the pane: coherence under the threshold means
+    // the measurement is not usable yet, no matter how good the curve looks. It has three
+    // answers rather than two, because a coherence read from too few averages is not a low
+    // score, it is no score at all, and calling it low would blame the room for a reading
+    // the estimator was never able to make.
+    const auto trustworthy = isCoherenceTrustworthy (averages);
+    const auto coherent = averageCoherence >= validityThreshold;
+    const auto usable = validBins > 0 && trustworthy && coherent;
+
+    validityLabel.setColour (juce::Label::textColourId,
+                             usable ? validColour : warningColour);
+
+    if (validBins == 0)
+    {
+        validityLabel.setText ("Referensi diam - tidak ada yang diukur", juce::dontSendNotification);
+    }
+    else if (! trustworthy)
+    {
+        validityLabel.setText ("Belum bisa dinilai - rata-rata " + juce::String (averages)
+                               + " frame, coherence belum bermakna", juce::dontSendNotification);
+    }
+    else if (! coherent)
+    {
+        validityLabel.setText ("Belum valid - coherence di bawah 80 %", juce::dontSendNotification);
+    }
+    else
+    {
+        validityLabel.setText ("Valid - coherence di atas 80 %", juce::dontSendNotification);
+    }
 
     repaint();
 }
@@ -114,6 +159,9 @@ TransferFunctionDisplay::Panes TransferFunctionDisplay::panes() const
 
     auto area = getLocalBounds().toFloat().reduced(14.0f, 18.0f).withTrimmedLeft(54.0f);
     area.removeFromTop(34.0f);
+
+    // The level sidebar is dropped from the right, so the three panes share what is left.
+    area.removeFromRight(sidebarArea().getWidth() + 12.0f);
 
     Panes result;
     const auto paneHeight = area.getHeight() / 3.0f;
@@ -191,7 +239,7 @@ void TransferFunctionDisplay::drawPane(juce::Graphics& g, const juce::Rectangle<
                                        const juce::Colour& colour, float referenceLine,
                                        bool showReference)
 {
-    g.setColour(panelColour);
+    g.setColour(plotColour);
     g.fillRoundedRectangle(bounds.withTrimmedTop(-22.0f).withTrimmedLeft(-8.0f)
                                .withTrimmedRight(-4.0f).withTrimmedBottom(-18.0f), 6.0f);
 
@@ -312,6 +360,204 @@ void TransferFunctionDisplay::drawFrequencyLabels(juce::Graphics& g, const juce:
     }
 }
 
+juce::Rectangle<float> TransferFunctionDisplay::sidebarArea() const
+{
+    // Wide enough for "Peak -120.0 dBFS" at the font size below, and no wider: this is a
+    // readout, not a second plot. It sits on the right, which is where the eye looks after
+    // reading a curve, and the panes give up the width for it.
+    const auto bounds = getLocalBounds().toFloat().reduced(14.0f, 18.0f);
+    const auto width = std::min (150.0f, std::max (0.0f, bounds.getWidth() * 0.18f));
+
+    return bounds.withTrimmedLeft(std::max(54.0f, bounds.getWidth() - width))
+                 .withTrimmedTop(34.0f)
+                 .reduced(0.0f, 4.0f);
+}
+
+void TransferFunctionDisplay::drawLevelSidebar(juce::Graphics& g)
+{
+    const auto area = sidebarArea();
+
+    if (area.getWidth() < 60.0f)
+        return;
+
+    g.setColour(panelColour);
+    g.fillRoundedRectangle(area, 6.0f);
+
+    // One block per channel, measured first so it matches the magnitude curve it belongs
+    // to. Both figures are named: "RMS / Peak" read as a pair, while a bare dBFS could be
+    // taken for either of them.
+    const auto block = [&g, &area, this] (const juce::String& title, const juce::Colour& colour,
+                                         float rmsDb, float peakDb, float y)
+    {
+        const auto silent = rmsDb <= dsp::dbFloor + 1.0f && peakDb <= dsp::dbFloor + 1.0f;
+
+        g.setColour(colour);
+        g.setFont(juce::Font(12.0f, juce::Font::bold));
+        g.drawText(title, area.getX() + 10.0f, y, area.getWidth() - 20.0f, 16.0f,
+                   juce::Justification::centredLeft);
+
+        g.setFont(juce::Font(13.0f));
+        g.setColour(mutedColour);
+
+        if (silent)
+        {
+            g.drawText("RMS --", area.getX() + 10.0f, y + 19.0f, area.getWidth() - 20.0f, 16.0f,
+                       juce::Justification::centredLeft);
+            g.drawText("Peak -- dBFS", area.getX() + 10.0f, y + 37.0f, area.getWidth() - 20.0f, 16.0f,
+                       juce::Justification::centredLeft);
+            return y + 58.0f;
+        }
+
+        g.drawText("RMS " + juce::String(rmsDb, 1), area.getX() + 10.0f, y + 19.0f,
+                   area.getWidth() - 20.0f, 16.0f, juce::Justification::centredLeft);
+        g.drawText("Peak " + juce::String(peakDb, 1) + " dBFS", area.getX() + 10.0f, y + 37.0f,
+                   area.getWidth() - 20.0f, 16.0f, juce::Justification::centredLeft);
+        return y + 58.0f;
+    };
+
+    auto y = area.getY() + 10.0f;
+
+    g.setFont(juce::Font(12.0f, juce::Font::bold));
+    g.setColour(mutedColour);
+    g.drawText("Level", area.getX() + 10.0f, y, area.getWidth() - 20.0f, 16.0f,
+               juce::Justification::centredLeft);
+    y += 22.0f;
+
+    y = block("Mic", magnitudeColour, measRmsDb, measPeakDb, y);
+    y = block("Output / Ref", phaseColour, refRmsDb, refPeakDb, y);
+
+    // The delay belongs next to the levels: both describe what arrived, one as a level and
+    // one as a time.
+    g.setFont(juce::Font(12.0f, juce::Font::bold));
+    g.setColour(mutedColour);
+    g.drawText(delayAvailable ? juce::String("Delay ") + juce::String(delayMs, 3) + " ms"
+                              : juce::String("Delay --"),
+               area.getX() + 10.0f, y, area.getWidth() - 20.0f, 16.0f,
+               juce::Justification::centredLeft);
+}
+
+void TransferFunctionDisplay::computeEqTarget()
+{
+    eqTargetValid = false;
+
+    if (frequency.size() < 8 || magnitudeDb.size() != frequency.size()
+        || binValid.size() != frequency.size())
+        return;
+
+    // The target is the average of the band levels, not of the FFT bins. On a log axis
+    // the low end owns far more bins than the top, so averaging bins pulls the target
+    // down by however many bins the bass happens to have, and the suggested correction
+    // then tilts the whole curve with it.
+    const auto centres = dsp::octaveBandFrequencies(3, minFrequency, maxFrequency);
+    double sum = 0.0;
+    int bands = 0;
+
+    for (size_t band = 0; band < centres.size(); ++band)
+    {
+        const auto low = band == 0 ? minFrequency
+                                    : std::sqrt(centres[band - 1] * centres[band]);
+        const auto high = band + 1 >= centres.size() ? maxFrequency
+                                                      : std::sqrt(centres[band] * centres[band + 1]);
+
+        double bandSum = 0.0;
+        int count = 0;
+
+        for (size_t i = 0; i < frequency.size(); ++i)
+            if (binValid[i] != 0 && frequency[i] >= low && frequency[i] < high)
+            {
+                bandSum += magnitudeDb[i];
+                ++count;
+            }
+
+        if (count > 0)
+        {
+            sum += bandSum / count;
+            ++bands;
+        }
+    }
+
+    if (bands < 6)
+        return;
+
+    eqTargetDb = (float) (sum / bands);
+    eqTargetValid = true;
+}
+
+void TransferFunctionDisplay::drawEqCorrection(juce::Graphics& g,
+                                               const juce::Rectangle<float>& bounds) const
+{
+    if (!eqTargetValid || frequency.size() != magnitudeDb.size()
+        || binValid.size() != frequency.size())
+        return;
+
+    const auto correctionColour = juce::Colour(0xffff8a80);
+
+    // The flat line the correction aims for, so the curve can be read against something
+    // instead of against the eye's guess of the middle of the plot.
+    const auto targetY = bounds.getBottom()
+                       - (juce::jlimit(bottomDb, topDb, eqTargetDb) - bottomDb)
+                         / (topDb - bottomDb) * bounds.getHeight();
+
+    g.setColour(mutedColour.withAlpha(0.5f));
+
+    for (float x = bounds.getX(); x < bounds.getRight(); x += 8.0f)
+        g.drawHorizontalLine(juce::roundToInt(targetY), juce::roundToInt(x),
+                             juce::roundToInt(juce::jmin(bounds.getRight(), x + 4.0f)));
+
+    std::vector<juce::Point<float>> points;
+
+    for (size_t i = 0; i < magnitudeDb.size(); ++i)
+    {
+        if (binValid[i] == 0)
+        {
+            points.clear();
+            continue;
+        }
+
+        const auto value = juce::jlimit(-maxCorrectionDb, maxCorrectionDb,
+                                        eqTargetDb - magnitudeDb[i]);
+        const auto y = bounds.getBottom()
+                     - (juce::jlimit(bottomDb, topDb, value) - bottomDb)
+                       / (topDb - bottomDb) * bounds.getHeight();
+
+        points.push_back({ frequencyToX(frequency[i], bounds), y });
+    }
+
+    // Drawn dash by dash because the correction is a reference curve, not a second
+    // measurement, and a reader must not confuse the two.
+    g.saveState();
+    g.reduceClipRegion(bounds.toNearestInt());
+    g.setColour(correctionColour);
+
+    const float dashOn = 6.0f, dashOff = 5.0f;
+
+    for (size_t i = 1; i < points.size(); ++i)
+    {
+        const auto from = points[i - 1], to = points[i];
+        const auto length = from.getDistanceFrom(to);
+
+        if (length < 0.5f)
+            continue;
+
+        for (float travelled = 0.0f; travelled < length; travelled += dashOn + dashOff)
+        {
+            const auto end = std::min(length, travelled + dashOn);
+            const auto a = from + (to - from) * (travelled / length);
+            const auto b = from + (to - from) * (end / length);
+            g.drawLine((float) a.x, (float) a.y, (float) b.x, (float) b.y, 1.4f);
+        }
+    }
+
+    g.restoreState();
+
+    g.setColour(correctionColour);
+    g.setFont(juce::Font(11.0f));
+    g.drawText("Koreksi EQ, target " + juce::String(eqTargetDb, 1) + " dB (batas "
+                   + juce::String((int) maxCorrectionDb) + " dB)",
+               bounds.getX() + 6.0f, bounds.getBottom() - 16.0f, bounds.getWidth() - 12.0f, 16.0f,
+               juce::Justification::bottomRight);
+}
+
 void TransferFunctionDisplay::paint(juce::Graphics& g)
 {
     g.fillAll(backgroundColour);
@@ -322,10 +568,15 @@ void TransferFunctionDisplay::paint(juce::Graphics& g)
 
     drawPane(g, areas.magnitude, "Magnitude", "dB", magnitudeDb, binValid, topDb, bottomDb,
              magnitudeColour);
+
+    if (showEqOverlay)
+        drawEqCorrection(g, areas.magnitude);
+
     drawPane(g, areas.phase, "Phase", "deg", phaseDeg, binValid, 180.0f, -180.0f, phaseColour);
     drawPane(g, areas.coherence, "Coherence", "", coherence, binValid, 1.0f, 0.0f,
              coherenceColour, validityThreshold, true);
     drawFrequencyLabels(g, areas.coherence);
+    drawLevelSidebar(g);
 }
 
 void TransferFunctionDisplay::updateCursorReadout(const juce::Rectangle<float>& bounds)
@@ -381,6 +632,8 @@ void TransferFunctionDisplay::resized()
     findDelayButton.setBounds(controls.removeFromRight(140.0f).reduced(0.0f, 2.0f));
     controls.removeFromRight(8.0f);
     freezeButton.setBounds(controls.removeFromRight(110.0f).reduced(0.0f, 2.0f));
+    controls.removeFromRight(8.0f);
+    eqOverlayButton.setBounds(controls.removeFromRight(110.0f).reduced(0.0f, 2.0f));
     controls.removeFromRight(8.0f);
     const auto validityWidth = juce::jmin(controls.getWidth(), 420);
     validityLabel.setBounds(controls.withSizeKeepingCentre(juce::jmax(0, validityWidth),

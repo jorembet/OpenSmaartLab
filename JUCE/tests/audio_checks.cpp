@@ -45,6 +45,10 @@ int main()
             "Delay must detect a microphone lag of 10 ms");
 
     AudioEngine engine;
+    require (! engine.getHardwareInputGainInfo().available,
+             "Hardware input gain must stay unavailable until an input device is opened");
+    require (! engine.setHardwareInputGainDb (0.0f),
+             "A missing hardware mixer must report failure instead of claiming to set gain");
     engine.audioDeviceAboutToStart(nullptr);
     std::vector<float> block(1024);
     const float* inputs[] = { block.data() };
@@ -810,6 +814,58 @@ int main()
                  "A single transient must lift the peak far above the RMS");
     }
 
+    // ---- Transfer function levels ----
+    {
+        // The sidebar next to the panes reads RMS and peak of both blocks. They have to come
+        // out of the measurement itself, because the magnitude curve is normalised: a curve
+        // that looks flat while the level falls says nothing about how loud it is.
+        std::vector<float> full (size), half (size);
+
+        for (int i = 0; i < size; ++i)
+        {
+            const auto sample = std::sin (2.0f * dsp::pi * 1000.0f * i / rate);
+            full[(size_t) i] = sample;
+            half[(size_t) i] = sample * 0.5f;
+        }
+
+        TransferFunction levels;
+        levels.prepare (rate, size);
+        levels.setAutomaticDelay (false);
+
+        const auto result = levels.process (full.data(), half.data(), size);
+
+        // The measurement is the quieter of the two here, so it is the one at -6.02 dBFS
+        // peak: both blocks have to be reported at their own level, never at each other's.
+        require (std::abs (result.measPeakDb + 6.0206f) < 0.05f,
+                 "The measured block must report its peak in dBFS");
+        require (std::abs (result.measRmsDb + 9.0309f) < 0.05f,
+                 "The measured block must report its RMS in dBFS");
+        require (result.measPeakDb - result.measRmsDb > 2.9f
+                 && result.measPeakDb - result.measRmsDb < 3.1f,
+                 "Peak must sit 3.01 dB above RMS for a half-scale sine");
+        require (std::abs (result.refPeakDb) < 0.05f
+                 && std::abs (result.refRmsDb + 3.0103f) < 0.05f,
+                 "The reference block must be reported at its own level");
+
+        // A single transient has to lift the peak far above the RMS, which is the whole
+        // reason the two figures are shown side by side.
+        auto burst = std::vector<float> ((size_t) size, 0.0f);
+        burst[0] = 0.5f;
+
+        const auto transient = levels.process (full.data(), burst.data(), size);
+        require (transient.measPeakDb - transient.measRmsDb > 40.0f,
+                 "A single transient must lift the peak far above the RMS");
+
+        // Silence must report the floor, so the sidebar hides itself instead of showing a
+        // level that was never measured.
+        std::vector<float> silence ((size_t) size, 0.0f);
+        const auto quiet = levels.process (silence.data(), silence.data(), size);
+        require (quiet.measRmsDb <= dsp::dbFloor + 0.01f
+                 && quiet.measPeakDb <= dsp::dbFloor + 0.01f
+                 && quiet.refRmsDb <= dsp::dbFloor + 0.01f,
+                 "Silence must report the dB floor for both RMS and peak");
+    }
+
     // ---- Pink noise must sit inside 20 Hz to 20 kHz ----
     {
         SignalGenerator generator;
@@ -1044,7 +1100,22 @@ int main()
         // Type names come from the generator itself, so a renamed selector cannot leave
         // the plot matching on a string that no longer exists.
         const auto types = SignalGenerator::getTypeNames();
-        require (types.size() == 4, "The generator must still expose four signal types");
+        require (types.size() == 8, "The generator must expose all eight signal types");
+
+        // The names are the contract between the generator and the selector, so each of the
+        // eight has to survive the round trip. A waveform the selector cannot name is one the
+        // user cannot select again after leaving the page.
+        const char* const required[] = { "Pink Noise", "White Noise", "Sine", "Square",
+                                         "Triangle", "Saw", "Impulse", "Log Sweep" };
+
+        for (auto* name : required)
+            require (types.contains (name),
+                    ("The generator must offer the " + juce::String (name) + " waveform")
+                        .toRawUTF8());
+
+        for (int i = 0; i < types.size(); ++i)
+            require (SignalGenerator::typeFromName (types[i]) == (SignalGenerator::Type) i,
+                    ("Type " + types[i] + " must map back to its own entry").toRawUTF8());
 
         const auto pink = dsp::generatorViewRange (types[0], 20.0f, 20000.0f,
                                                     1000.0f, 20.0f, 20000.0f);
@@ -1363,6 +1434,191 @@ int main()
         require (quietResult.validBins == 0 && quietResult.averageCoherence == 0.0f,
                  "A silent reference must report no measurable bins and no coherence");
 
+        // The app itself always runs the automatic search, so the averages have to survive
+        // it. If the search threw them away the reading would look like a single frame no
+        // matter how many averages were asked for, which is exactly what the validity line
+        // reports on.
+        TransferFunction automatic;
+        automatic.prepare (rate, tfFft);
+        automatic.setAveraging (16);
+        automatic.setAutomaticDelay (true);
+
+        TransferFunction::Result autoResult;
+
+        for (int frame = 0; frame < 64; ++frame)
+            autoResult = automatic.process (tfRefs[(size_t) (frame % frames)].data(),
+                                             tfMeasAll[(size_t) (frame % frames)].data(), tfFft);
+
+        require (autoResult.averageCoherence > 0.9f,
+                 "The automatic delay search must not destroy the averages it runs beside");
+
+        // A real loop drifts: the speaker is played by the output device while the
+        // microphone captures on the input device, and the two clocks are never identical,
+        // so the delay walks by a few samples from frame to frame. Averaging has to follow
+        // it per frame. If the compensation is only applied to the finished average, the
+        // frames recorded at another delay cancel each other and the coherence settles
+        // around 0.6 whatever the averaging says.
+        std::vector<std::vector<float>> driftingMeas (frames);
+
+        for (int frame = 0; frame < frames; ++frame)
+        {
+            // The delay steps by 2 samples and swings 6 samples across four frames. Every
+            // step is inside the 4 sample hysteresis, so the average is never thrown away
+            // and the measurement has to stay usable; at 2 kHz a 6 sample error is already
+            // 90 degrees of phase.
+            const auto drift = ((frame % 4) - 1) * 2;
+            const auto lag = tfLag + drift;
+            auto& block = driftingMeas[(size_t) frame];
+            block.assign ((size_t) tfFft, 0.0f);
+
+            for (int i = tfFft - 1; i >= lag; --i)
+                block[(size_t) i] = tfRefs[(size_t) frame][(size_t) (i - lag)] * 0.5f + noise (rng);
+        }
+
+        TransferFunction drifting;
+        drifting.prepare (rate, tfFft);
+        drifting.setAveraging (16);
+        drifting.setAutomaticDelay (true);
+
+        TransferFunction::Result driftResult;
+
+        for (int frame = 0; frame < 64; ++frame)
+            driftResult = drifting.process (tfRefs[(size_t) (frame % frames)].data(),
+                                             driftingMeas[(size_t) (frame % frames)].data(), tfFft);
+
+        // A path that is tracked every frame is coherent to the last decimal. Compensating
+        // the finished average instead leaves the frames recorded at another delay rotated
+        // against each other, which lands around 0.93 here and far lower on a real loop,
+        // where the windows overlap and the error adds up instead of averaging out.
+        require (driftResult.coherence[binNear (driftResult.freq, 2000.0f)] > 0.98f,
+                 "A delay that drifts a few samples per frame must be tracked per frame, "
+                 "or the average smears and the measurement never becomes valid");
+
+        // A correlation peak is only believable if the aligned pair really looks like one
+        // signal. With unrelated signals the correlation is a broad smear and its strongest
+        // point lands somewhere arbitrary, which is how a measurement ends up rotated by a
+        // delay no physical path could produce: magnitude and coherence stay perfect,
+        // because neither looks at phase, and only the phase curve gives it away.
+        std::vector<std::vector<float>> unrelatedRefs (frames), unrelatedMeas (frames);
+
+        for (int frame = 0; frame < frames; ++frame)
+        {
+            unrelatedRefs[(size_t) frame].assign ((size_t) tfFft, 0.0f);
+            unrelatedMeas[(size_t) frame].assign ((size_t) tfFft, 0.0f);
+
+            for (int i = 0; i < tfFft; ++i)
+            {
+                unrelatedRefs[(size_t) frame][(size_t) i] = noise (rng);
+                unrelatedMeas[(size_t) frame][(size_t) i] = noise (rng) * 0.5f;
+            }
+        }
+
+        TransferFunction unrelated;
+        unrelated.prepare (rate, tfFft);
+        unrelated.setAveraging (16);
+        unrelated.setAutomaticDelay (true);
+
+        for (int frame = 0; frame < 16; ++frame)
+            unrelated.process (unrelatedRefs[(size_t) frame].data(),
+                               unrelatedMeas[(size_t) frame].data(), tfFft);
+
+        require (! unrelated.isDelayTrusted(),
+                 "A delay peak that the aligned pair does not support must not be believed");
+        require (unrelated.getDelaySamples() == 0.0f,
+                 "An unbelievable search must leave the previous delay alone");
+
+        // The same measurement must be believed when the pair really is one signal.
+        require (drifting.isDelayTrusted(),
+                 "A delay found on a coherent pair must be accepted");
+
+        // ---- A measurement with no signal must not draw a phase ----
+        {
+// A loud reference with a measurement 80 dB below it. The reference is there, so
+            // nothing in the reference alone blanks these bins, yet there is no measurement
+            // to have a magnitude or a phase about. Drawing them would put a full curve
+            // across a band that was never measured.
+            std::vector<float> quietMeas ((size_t) tfFft, 0.0f);
+
+            for (int frame = 0; frame < frames; ++frame)
+                for (int i = 0; i < tfFft; ++i)
+                    quietMeas[(size_t) i] = tfRefs[(size_t) frame][(size_t) i] * 1.0e-4f;
+
+            TransferFunction silentPath;
+            silentPath.prepare (rate, tfFft);
+            silentPath.setAveraging (16);
+            silentPath.setAutomaticDelay (false);
+
+            TransferFunction::Result quietResult;
+
+            for (int frame = 0; frame < frames; ++frame)
+                quietResult = silentPath.process (tfRefs[(size_t) frame].data(),
+                                                   quietMeas.data(), tfFft);
+
+            auto drawn = 0;
+
+            for (size_t i = 0; i < quietResult.binValid.size(); ++i)
+                drawn += quietResult.binValid[i] != 0 ? 1 : 0;
+
+            require (drawn == 0,
+                     "A measurement 80 dB below the reference must not be drawn as magnitude "
+                     "and phase: there is nothing there to have a phase about");
+            require (quietResult.magnitudeDb[midBin] <= dsp::dbFloor + 0.5f
+                     && quietResult.phaseDeg[midBin] == 0.0f,
+                     "An undrawn bin must not leave a magnitude or a phase behind");
+
+            // Noise on the measurement is the other half of the same complaint. Unlike an
+            // attenuated signal it does produce a finite transfer function, because noise
+            // adds in quadrature, and that magnitude stays worth looking at. Its phase is
+            // not: where the channels are unrelated the angle is uniformly spread noise,
+            // so the phase pane breaks there while the magnitude pane keeps its curve.
+            std::vector<float> unrelatedMeas ((size_t) tfFft, 0.0f);
+
+            // Full level, so the magnitude floor is nowhere near it: only the coherence can
+            // be what hides the phase here.
+            for (int i = 0; i < tfFft; ++i)
+                unrelatedMeas[(size_t) i] = distribution (random);
+
+            TransferFunction noisePath;
+            noisePath.prepare (rate, tfFft);
+            noisePath.setAveraging (16);
+            noisePath.setAutomaticDelay (false);
+
+            TransferFunction::Result noiseResult;
+
+            for (int frame = 0; frame < frames; ++frame)
+                noiseResult = noisePath.process (tfRefs[(size_t) frame].data(),
+                                                  unrelatedMeas.data(), tfFft);
+
+            // Both curves stay on screen here. The measurement carries signal, so there is
+            // something to draw; what makes it unusable is reported, not hidden: the
+            // magnitude reads low by the noise it contains and the phase is spread out, and
+            // the coherence pane plus the validity banner are what say the band cannot be
+            // trusted. Blank the phase here and the evidence disappears with the conclusion.
+            require (noiseResult.binValid[(size_t) midBin] != 0,
+                     "A measurement carrying signal must keep both curves");
+            require (noiseResult.magnitudeDb[(size_t) midBin] > -60.0f
+                     && noiseResult.coherence[(size_t) midBin] < 0.5f,
+                     "That band must show a magnitude and report the low coherence that "
+                     "makes it unusable");
+
+            // The same path with a real measurement keeps both curves, so the rules above
+            // cannot be satisfied by blanking everything.
+            TransferFunction heardPath;
+            heardPath.prepare (rate, tfFft);
+            heardPath.setAveraging (16);
+            heardPath.setAutomaticDelay (false);
+
+            for (int frame = 0; frame < frames; ++frame)
+                heardPath.process (tfRefs[(size_t) frame].data(), tfMeasAll[(size_t) frame].data(), tfFft);
+
+            const auto heard = heardPath.process (tfRefs[0].data(), tfMeasAll[0].data(), tfFft);
+            require (heard.binValid[(size_t) midBin] != 0 && heard.coherence[(size_t) midBin] > 0.9f,
+                     "A band with signal on both channels must be drawn and read as valid");
+
+            std::cout << "PASS: a measurement with no signal draws no curve, and a noisy one is\n";
+        std::cout << "      reported as unusable rather than hidden\n";
+        }
+
         // Blanking is a range below the strongest reference bin, so it has to follow the
         // level of whatever is being measured.
         TransferFunction wide;
@@ -1389,6 +1645,7 @@ int main()
     std::cout << "PASS: 100-bar linear RTA centres 119.9-19900 Hz, 1500 Hz tone detection, DC rejected\n";
     std::cout << "PASS: frequency labels are bold, sized for the row, and all 31 fit at 1/3 octave\n";
     std::cout << "PASS: RTA RMS/peak figures are 3.01 dB apart on a full-scale sine and hide silence\n";
+    std::cout << "PASS: transfer function reports RMS and peak of both blocks, and hides silence\n";
     std::cout << "PASS: typed generator frequencies are applied exactly and out-of-range values clamp\n";
     std::cout << "PASS: pink noise puts 95%+ of its power inside 20 Hz - 20 kHz and keeps its tilt\n";
     std::cout << "PASS: both pink noise band limits are adjustable and the signal follows them\n";

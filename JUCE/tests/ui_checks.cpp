@@ -95,14 +95,24 @@ int main()
     juce::ComboBox* bandPreset = nullptr;
     int listedItems = 0;
 
+    // Identified by what it lists, not by having the most items. Picking the largest combo box
+    // was a guess that happened to work until another selector with more entries was added,
+    // and it would have silently started inspecting the temperature list instead.
+    const auto presets = SignalGenerator::getBandPresets();
+
     for (auto* child : panel->getChildren())
     {
         auto* box = dynamic_cast<juce::ComboBox*> (child);
 
-        if (box != nullptr && box->getNumItems() > listedItems)
+        if (box == nullptr || presets.isEmpty())
+            continue;
+
+        if (box->getNumItems() == presets.size() + 1
+            && box->getItemText (0) == presets[0].name)
         {
             bandPreset = box;
             listedItems = box->getNumItems();
+            break;
         }
     }
 
@@ -149,6 +159,50 @@ int main()
 
         require(measurement->getSelectedId() != reference->getSelectedId(),
                 "Measurement and reference must not default to the same channel");
+    }
+
+    // Input gain is available in the tab itself and routes to the shared toolbar control,
+    // so changing it applies the same hardware gain or analysis trim everywhere.
+    {
+        const auto inputLevelTab = tabIndexFor ("Input Level");
+        require (inputLevelTab >= 0, "The Input Level tab must exist");
+        tabs->setCurrentTabIndex (inputLevelTab);
+
+        auto* inputPanel = tabs->getTabContentComponent (inputLevelTab);
+        juce::Slider* inputGain = nullptr;
+        juce::Label* inputGainLabel = nullptr;
+
+        for (auto* child : inputPanel->getChildren())
+        {
+            if (auto* slider = dynamic_cast<juce::Slider*> (child))
+                inputGain = slider;
+            else if (auto* label = dynamic_cast<juce::Label*> (child))
+                inputGainLabel = label;
+        }
+
+        require (inputGain != nullptr && inputGainLabel != nullptr,
+                 "Input Level must have a labeled manual gain control");
+        require (inputGainLabel->getText() == "Volume Trim"
+                     && std::abs (inputGain->getRange().getStart() + 60.0) < 0.01
+                     && std::abs (inputGain->getRange().getEnd() - 24.0) < 0.01,
+                 "The stopped-device input trim must expose a useful dB range");
+        require (inputGain->isVisible() && inputGain->getWidth() > 0
+                     && inputGainLabel->getRight() <= inputGain->getX(),
+                 "The gain label and slider must be visible without overlapping");
+
+        juce::Slider* sharedGain = nullptr;
+
+        for (auto* child : main.getChildren())
+            if (auto* slider = dynamic_cast<juce::Slider*> (child))
+                if (std::abs (slider->getRange().getStart() + 60.0) < 0.01
+                    && std::abs (slider->getRange().getEnd() - 24.0) < 0.01)
+                    sharedGain = slider;
+
+        require (sharedGain != nullptr, "The global mic gain control must be available");
+        inputGain->setValue (6.0, juce::sendNotificationSync);
+        require (std::abs (sharedGain->getValue() - 6.0) < 0.01,
+                 "Changing Input Level gain must update the shared mic gain");
+        inputGain->setValue (0.0, juce::sendNotificationSync);
     }
 
     // The generator output side has to be selectable too, so one output can stay silent
@@ -297,7 +351,7 @@ int main()
 
     // The narrowed band is the midrange driver preset, so the screenshot shows the case
     // a user works in when boosting one driver.
-    const auto presets = SignalGenerator::getBandPresets();
+    const auto panelPresets = SignalGenerator::getBandPresets();
     generator.setBandLimits(presets[2].lowFrequency, presets[2].highFrequency);
     display.setGeneratorSettings(generator.getBandLow(), generator.getBandHigh(),
                                  generator.getFrequency(),
@@ -513,6 +567,10 @@ int main()
         result.averageCoherence = 0.93f;
         result.delayMs = 5.33f;
         result.peakReferenceDb = -12.0f;
+        result.measRmsDb = -18.4f;
+        result.measPeakDb = -6.2f;
+        result.refRmsDb = -12.6f;
+        result.refPeakDb = -1.3f;
         result.valid = true;
 
         tfDisplay.pushData(result);
@@ -521,11 +579,21 @@ int main()
         require(tfDisplay.getAverageCoherence() > TransferFunctionDisplay::validityThreshold,
                 "A measurement above the threshold must read as valid");
 
+        // The sidebar has to carry the levels the panes normalise away: a magnitude curve
+        // that looks flat says nothing about how loud the measurement actually was.
+        require(std::abs(tfDisplay.getMeasuredRmsDb() + 18.4f) < 0.05f
+                && std::abs(tfDisplay.getMeasuredPeakDb() + 6.2f) < 0.05f,
+                "The sidebar must show the measured RMS and peak");
+        require(std::abs(tfDisplay.getReferenceRmsDb() + 12.6f) < 0.05f
+                && std::abs(tfDisplay.getReferencePeakDb() + 1.3f) < 0.05f,
+                "The sidebar must show the reference RMS and peak");
+
         saveSnapshot(tfDisplay, png, "/tmp/opensmaart-tf-panes.png");
     }
 
     std::cout << "PASS: Generator spectrum renders the configured pink band, tone and sweep range\n";
     std::cout << "PASS: Transfer Function panes draw magnitude, phase and coherence with blanked bins\n";
+    std::cout << "PASS: Transfer Function sidebar shows RMS and peak for both channels\n";
     std::cout << "PASS: Spectrogram records level history and follows the display range\n";
     std::cout << "PASS: Generator header reports the tilt of the configured band and the tone frequency\n";
 }
