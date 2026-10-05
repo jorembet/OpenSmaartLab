@@ -27,11 +27,22 @@ void BlockAnalyser::prepare(float newSampleRate, int newFftSize,
     window.multiplyWithWindowingTable(probe.data(), fftSize);
 
     double total = 0.0;
+    double squares = 0.0;
 
     for (auto value : probe)
-        total += value;
+    {
+        total += (double) value;
+        squares += (double) value * value;
+    }
 
-    coherentGain = (float) (total / std::max(1.0, (double) fftSize));
+    coherentGain = (float) (total / std::max (1.0, (double) fftSize));
+
+    // The window's mean square, which is how much of the sound's own power it lets through.
+    // A power taken from a windowed transform is this much smaller than the sound's power, and
+    // leaving it out puts every reading a fixed few decibels low. Measured from the window
+    // rather than assumed, because that assumption has to hold for whatever window is in use
+    // rather than only for Hann.
+    windowMeanSquare = (float) (squares / std::max (1.0, (double) fftSize));
 }
 
 void BlockAnalyser::reset()
@@ -109,7 +120,14 @@ float BlockAnalyser::levelDb(const float* block, char weighting) const
         const auto gain = weightingGain(getBinFrequency(i), weighting);
         const auto re = (double) (scratch[i * 2] * gain);
         const auto im = (double) (scratch[i * 2 + 1] * gain);
-        const auto power = re * re + im * im;
+
+        auto power = re * re + im * im;
+
+        // The correction is a level, so it scales the power rather than the amplitude. Applied
+        // per bin and before the sum, which is the whole point: applying it after the sum would
+        // be a single number standing in for a spectrum.
+        if (i < (int) binCorrectionDb.size() && binCorrectionDb[(size_t) i] != 0.0f)
+            power *= std::pow(10.0, (double) binCorrectionDb[(size_t) i] / 10.0);
 
         sum += (i == 0 || i == numBins - 1) ? power : 2.0 * power;
     }

@@ -43,5 +43,24 @@ public:
                              const std::vector<float>& decayDb,
                              float upperLevelDb, float lowerLevelDb);
 
+    /** RT60 estimated separately in octave bands. A room that rings mostly at one
+        frequency shows up as a tall bar there, which the broadband figure hides. */
+    struct BandRt60 { float frequency = 0.0f; float rt60 = 0.0f; bool valid = false; };
+    static std::vector<BandRt60> bandRt60(const float* ir, int numSamples, float sampleRate,
+                                          const std::vector<float>& centres);
+
+    /** Short-time magnitude of the impulse response, normalised per frame, as a
+        waterfall. Times down the rows, bands across the columns. */
+    struct Waterfall
+    {
+        std::vector<std::vector<float>> framesDb;
+        std::vector<float> bandCentres;
+        std::vector<float> times;
+        bool valid = false;
+    };
+    static Waterfall waterfall(const float* ir, int numSamples, float sampleRate,
+                               const std::vector<float>& centres, int frameSize = 2048,
+                               int hopSize = 1024);
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ImpulseResponse)
 };

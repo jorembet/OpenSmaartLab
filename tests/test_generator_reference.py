@@ -4,6 +4,7 @@ import types
 import unittest
 from unittest.mock import patch
 import numpy as np
+from dsp import find_delay
 
 
 class FakeStream:
@@ -24,7 +25,6 @@ fake_sd = types.SimpleNamespace(InputStream=FakeStream, OutputStream=FakeStream,
                                 Stream=FakeStream, query_devices=lambda *args: {"max_output_channels": 2})
 with patch.dict(sys.modules, {"sounddevice": fake_sd}):
     from audio_engine import AudioEngine
-from dsp import find_delay
 
 
 class GeneratorReferenceTests(unittest.TestCase):

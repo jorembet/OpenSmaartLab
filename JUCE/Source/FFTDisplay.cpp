@@ -2,20 +2,19 @@
 
 namespace
 {
-    const juce::Colour spectrogramFloorColour = juce::Colour(0xff141a26);
+    const juce::Colour spectrogramFloorColour = juce::Colour(0xff101010);
     constexpr int linearBarCount = 100;
 
-    const juce::Colour backgroundColour = juce::Colour(0xff111318);
-    const juce::Colour panelColour = juce::Colour(0xff1b1f27);
-    const juce::Colour gridColour = juce::Colour(0xff232833);
-    const juce::Colour gridBoldColour = juce::Colour(0xff39404f);
+    const juce::Colour backgroundColour = juce::Colour(0xff1d1d1d);
+    const juce::Colour panelColour = juce::Colour(0xff262626);
+    const juce::Colour plotColour = juce::Colour(0xff050505);
+    const juce::Colour gridColour = juce::Colour(0xff383838);
+    const juce::Colour gridBoldColour = juce::Colour(0xff555555);
     const juce::Colour textColour = juce::Colour(0xffe6e9ef);
-    const juce::Colour mutedColour = juce::Colour(0xff8892a0);
+    const juce::Colour mutedColour = juce::Colour(0xff9a9a9a);
     const juce::Colour channelOneColour = juce::Colour(0xff4fc3f7);
     const juce::Colour channelTwoColour = juce::Colour(0xff9ccc65);
     const juce::Colour transferColour = juce::Colour(0xffffb74d);
-    const juce::Colour coherenceColour = juce::Colour(0xffee82ee);
-    const juce::Colour phaseColour = juce::Colour(0xfff06292);
 
     struct RangePreset
     {
@@ -84,9 +83,6 @@ FFTDisplay::FFTDisplay()
 
     modeSelector.addItem("RTA Microphone", (int) Mode::SingleChannel);
     modeSelector.addItem("Dual Channel", (int) Mode::DualChannel);
-    modeSelector.addItem("Transfer Function", (int) Mode::TransferFunction);
-    modeSelector.addItem("Coherence", (int) Mode::Coherence);
-    modeSelector.addItem("Phase", (int) Mode::Phase);
     modeSelector.setSelectedId((int) mode);
     modeSelector.onChange = [this]
     {
@@ -107,6 +103,9 @@ FFTDisplay::FFTDisplay()
         octaveFraction = octaveSelector.getSelectedId() == 100 ? 0 : octaveSelector.getSelectedId();
         displayDirty = true;
         repaint();
+
+        if (onOctaveChanged != nullptr)
+            onOctaveChanged();
     };
 
     rangeSelector.addItem(rangePresets[0].name, 1);
@@ -122,11 +121,58 @@ FFTDisplay::FFTDisplay()
                                         rangeSelector.getSelectedId() - 1);
         topDb = rangePresets[index].top;
         bottomDb = rangePresets[index].bottom;
+        topDbEditor.setText (juce::String ((int) topDb), juce::dontSendNotification);
+        bottomDbEditor.setText (juce::String ((int) bottomDb), juce::dontSendNotification);
         displayDirty = true;
         repaint();
     };
     topDb = rangePresets[5].top;
     bottomDb = rangePresets[5].bottom;
+    // The fields start on the range in effect rather than empty, so switching them on shows
+    // what is set instead of two blanks to type from scratch.
+    topDbEditor.setText (juce::String ((int) topDb), juce::dontSendNotification);
+    bottomDbEditor.setText (juce::String ((int) bottomDb), juce::dontSendNotification);
+
+    manualRangeButton.setTooltip("Ketik batas atas dan bawah sumbu dB sendiri, "
+                                 "misal -20 sampai -90");
+    manualRangeButton.onClick = [this] { setRangeEditorsVisible (!rangeEditorsVisible); };
+    manualRangeButton.setToggleState (false, juce::dontSendNotification);
+    addAndMakeVisible(manualRangeButton);
+
+    const auto editFinished = [this]
+    {
+        const auto topText = topDbEditor.getText().trim();
+        const auto bottomText = bottomDbEditor.getText().trim();
+
+        // An empty field is left alone: reading it as 0 dB would silently flatten the
+        // whole axis, which is not what clearing the box asks for.
+        if (topText.isEmpty() || bottomText.isEmpty())
+        {
+            topDbEditor.setText (juce::String ((int) topDb), juce::dontSendNotification);
+            bottomDbEditor.setText (juce::String ((int) bottomDb), juce::dontSendNotification);
+            return;
+        }
+
+        setRange(topText.getFloatValue(), bottomText.getFloatValue());
+
+        // Whatever was typed, the fields show the range that was actually applied: the
+        // limits are clamped to the usable scale, and swapped if they came in reversed.
+        topDbEditor.setText (juce::String ((int) topDb), juce::dontSendNotification);
+        bottomDbEditor.setText (juce::String ((int) bottomDb), juce::dontSendNotification);
+    };
+
+    for (auto* editor : { &topDbEditor, &bottomDbEditor })
+    {
+        // Four characters cover the widest range the axis allows, -160 to +12.
+        editor->setInputRestrictions (4, "-0123456789.");
+        editor->setJustification (juce::Justification::centredRight);
+        editor->setTooltip (editor == &topDbEditor ? "Batas atas sumbu dB"
+                                                    : "Batas bawah sumbu dB");
+        editor->onReturnKey = editFinished;
+        editor->onFocusLost = editFinished;
+        editor->setVisible (false);
+        addAndMakeVisible (editor);
+    }
 
     peakHoldButton.onClick = [this] { setPeakHold(peakHoldButton.getToggleState()); };
     freezeButton.onClick = [this]
@@ -338,6 +384,12 @@ void FFTDisplay::setOctaveFraction(int fraction)
 
 void FFTDisplay::setRange(float top, float bottom)
 {
+    // The two limits may arrive in either order, so they are put the right way
+    // round before anything else looks at them: clamping first would otherwise turn a
+    // reversed pair into a valid looking but inverted axis.
+    if (bottom > top)
+        std::swap (top, bottom);
+
     // The window has to stay a usable size and stay inside the level scale: a top above
     // +12 dB would only add headroom, and a range narrower than 20 dB collapses the axis
     // divisions onto one line and inverts the colour scale.
@@ -347,7 +399,25 @@ void FFTDisplay::setRange(float top, float bottom)
     if (bottomDb > topDb - 20.0f)
         bottomDb = topDb - 20.0f;
 
+    // The preset combo has no entry for a hand typed range, so it is deselected: leaving
+    // it on "0 / -120" while the axis shows something else is a readout that lies.
+    rangeSelector.setSelectedId (0, juce::dontSendNotification);
     displayDirty = true;
+    repaint();
+}
+
+void FFTDisplay::setRangeEditorsVisible(bool shouldShow)
+{
+    rangeEditorsVisible = shouldShow;
+    manualRangeButton.setToggleState (shouldShow, juce::dontSendNotification);
+
+    if (shouldShow)
+    {
+        topDbEditor.setText (juce::String ((int) topDb), juce::dontSendNotification);
+        bottomDbEditor.setText (juce::String ((int) bottomDb), juce::dontSendNotification);
+    }
+
+    resized();
     repaint();
 }
 
@@ -479,7 +549,7 @@ void FFTDisplay::pushData(const std::vector<float>& freq,
 
     // One column per frame of live data, so the time axis is real time and not the
     // refresh rate of the window.
-    if (style == Style::Spectrogram)
+    if (style == Style::Spectrogram && isShowing())
         pushSpectrogramFrame(current);
 
     // Only the microphone channel is calibrated. The reference channel is usually a
@@ -487,8 +557,12 @@ void FFTDisplay::pushData(const std::vector<float>& freq,
     if (calibration.isEnabled() && mode == Mode::SingleChannel)
         calibration.apply (current.measDb, current.freq);
 
-    rebuildDisplay();
-    updatePeakHold();
+    displayDirty = true;
+    if (isShowing())
+    {
+        rebuildDisplay();
+        updatePeakHold();
+    }
     repaint();
 }
 
@@ -566,29 +640,6 @@ void FFTDisplay::rebuildDisplay()
             break;
         }
 
-        case Mode::TransferFunction:
-        {
-            dsp::smoothMagnitudeDb(frame.freq, frame.tfDb, octaveFraction, smoothed.emplace_back());
-            display.traces.push_back({ &smoothed.back(), transferColour, "TF" });
-            display.axis = Axis::Decibels;
-            break;
-        }
-
-        case Mode::Coherence:
-        {
-            dsp::smoothCoherence(frame.freq, frame.coherence, octaveFraction, smoothed.emplace_back());
-            display.traces.push_back({ &smoothed.back(), coherenceColour, "Coh" });
-            display.axis = Axis::Coherence;
-            break;
-        }
-
-        case Mode::Phase:
-        {
-            dsp::smoothPhaseDeg(frame.freq, frame.tfPhase, octaveFraction, smoothed.emplace_back());
-            display.traces.push_back({ &smoothed.back(), phaseColour, "Phase" });
-            display.axis = Axis::Phase;
-            break;
-        }
     }
 }
 
@@ -625,7 +676,85 @@ juce::Rectangle<float> FFTDisplay::plotArea() const
                .withTrimmedLeft (46.0f)
                .withTrimmedBottom (FrequencyLabels::reservedSpace());
 
+    // The level sidebar is dropped from the right, so the plot shares what is left.
+    area.removeFromRight(sidebarArea().getWidth() + 12.0f);
+
     return area;
+}
+
+juce::Rectangle<float> FFTDisplay::sidebarArea() const
+{
+    // Wide enough for "Peak -120.0 dBFS" at the font size below, and no wider: this is a
+    // readout, not a second plot. It sits on the right, which is where the eye looks after
+    // reading a curve, and the plot gives up the width for it.
+    const auto bounds = getLocalBounds().toFloat().reduced(24.0f, 18.0f);
+    const auto width = std::min (150.0f, std::max (0.0f, bounds.getWidth() * 0.18f));
+
+    return bounds.withTrimmedLeft(std::max(46.0f, bounds.getWidth() - width))
+                 .withTrimmedTop(40.0f)
+                 .withTrimmedBottom(FrequencyLabels::reservedSpace())
+                 .reduced(0.0f, 4.0f);
+}
+
+void FFTDisplay::drawLevelSidebar(juce::Graphics& g) const
+{
+    const auto area = sidebarArea();
+
+    if (area.getWidth() < 60.0f)
+        return;
+
+    g.setColour(panelColour);
+    g.fillRoundedRectangle(area, 6.0f);
+
+    // One block per channel, measured first so it matches the trace it belongs to. Both
+    // figures are named: "RMS / Peak" read as a pair, while a bare dBFS could be taken
+    // for either of them.
+    auto y = area.getY() + 10.0f;
+
+    g.setFont(juce::Font(12.0f, juce::Font::bold));
+    g.setColour(mutedColour);
+    g.drawText("Level", area.getX() + 10.0f, y, area.getWidth() - 20.0f, 16.0f,
+               juce::Justification::centredLeft);
+    y += 22.0f;
+
+    const auto block = [&g, &area, this] (const juce::String& title, const juce::Colour& colour,
+                                         const ChannelLevels& levels, float y)
+    {
+        const auto silent = levels.rmsDb <= dsp::dbFloor + 1.0f && levels.peakDb <= dsp::dbFloor + 1.0f;
+
+        g.setColour(colour);
+        g.setFont(juce::Font(12.0f, juce::Font::bold));
+        g.drawText(title, area.getX() + 10.0f, y, area.getWidth() - 20.0f, 16.0f,
+                   juce::Justification::centredLeft);
+
+        g.setFont(juce::Font(13.0f));
+        g.setColour(mutedColour);
+
+        if (silent)
+        {
+            g.drawText("RMS --", area.getX() + 10.0f, y + 19.0f, area.getWidth() - 20.0f, 16.0f,
+                       juce::Justification::centredLeft);
+            g.drawText("Peak -- dBFS", area.getX() + 10.0f, y + 37.0f, area.getWidth() - 20.0f, 16.0f,
+                       juce::Justification::centredLeft);
+            return y + 58.0f;
+        }
+
+        g.drawText("RMS " + juce::String(levels.rmsDb, 1), area.getX() + 10.0f, y + 19.0f,
+                   area.getWidth() - 20.0f, 16.0f, juce::Justification::centredLeft);
+        g.drawText("Peak " + juce::String(levels.peakDb, 1) + " dBFS", area.getX() + 10.0f, y + 37.0f,
+                   area.getWidth() - 20.0f, 16.0f, juce::Justification::centredLeft);
+        return y + 58.0f;
+    };
+
+    y = block(measurementLabel, traceColourFor(0), measLevels, y);
+
+    const auto aboveFloor = [] (const ChannelLevels& l)
+    {
+        return l.rmsDb > dsp::dbFloor + 1.0f || l.peakDb > dsp::dbFloor + 1.0f;
+    };
+
+    if (aboveFloor(refLevels))
+        block(referenceLabel, traceColourFor(1), refLevels, y);
 }
 
 // Smallest on-screen gap between two band centres, used to decide how many
@@ -818,6 +947,19 @@ void FFTDisplay::resized()
     octaveSelector.setBounds(controls.removeFromLeft(130));
     controls.removeFromLeft(8);
     rangeSelector.setBounds(controls.removeFromLeft(110));
+    controls.removeFromLeft(6);
+    manualRangeButton.setBounds(controls.removeFromLeft(86).reduced(0, 4));
+
+    // The fields take their width from what is left of this row, so showing them never
+    // pushes the toolbar past the window edge on a narrow window.
+    const auto editorWidth = rangeEditorsVisible
+                           ? juce::jmax(0, juce::jmin(52, (int) controls.getWidth() / 2 - 8))
+                           : 0;
+
+    for (auto* editor : { &topDbEditor, &bottomDbEditor })
+        editor->setBounds (editorWidth > 0 ? controls.removeFromLeft(editorWidth).reduced(0, 3)
+                                           : juce::Rectangle<int>());
+
     controls.removeFromLeft(12);
     peakHoldButton.setBounds(controls.removeFromLeft(110).reduced(0, 4));
     controls.removeFromLeft(6);
@@ -841,7 +983,10 @@ void FFTDisplay::paint(juce::Graphics& g)
     juce::ScopedLock lock(dataLock);
 
     if (displayDirty)
+    {
         rebuildDisplay();
+        updatePeakHold();
+    }
 
     if (style == Style::Spectrogram)
         drawSpectrogram(g, area);
@@ -858,8 +1003,10 @@ void FFTDisplay::paint(juce::Graphics& g)
         g.setColour(mutedColour);
         g.setFont(juce::Font(12.0f));
         g.drawText(getAxisLabel(), area.getX() - 44, area.getCentreY() - 10, 40, 20,
-                   juce::Justification::centredRight);
+                   juce::Justification::centred);
     }
+
+    drawLevelSidebar(g);
 
     drawCursor(g, area);
 
@@ -1060,7 +1207,7 @@ void FFTDisplay::pushSpectrogramFrame(const Frame& frame)
 
 void FFTDisplay::drawSpectrogram(juce::Graphics& g, const juce::Rectangle<float>& area) const
 {
-    g.setColour(panelColour);
+    g.setColour(plotColour);
     g.fillRect(area);
 
     const auto ticks = dsp::logAxisTicks(minFrequency, maxFrequency,
@@ -1128,7 +1275,7 @@ void FFTDisplay::drawSpectrogram(juce::Graphics& g, const juce::Rectangle<float>
 
 void FFTDisplay::drawGrid(juce::Graphics& g, const juce::Rectangle<float>& area) const
 {
-    g.setColour(panelColour);
+    g.setColour(plotColour);
     g.fillRect(area);
 
     g.setFont(juce::Font(11.0f));
@@ -1223,10 +1370,65 @@ void FFTDisplay::drawGrid(juce::Graphics& g, const juce::Rectangle<float>& area)
     g.drawRect(area, 1.0f);
 }
 
+juce::Colour FFTDisplay::peakHoldColourFor(size_t traceIndex) const
+{
+    // The peak hold line sits on top of a live curve of the same hue, so it is drawn in a
+    // colour the live trace cannot be: red for the microphone, bright green for the
+    // generator output. Both are the only red and green on the plot, which is what makes
+    // the held peak readable at a glance.
+    return traceIndex == 0 ? juce::Colour(0xffff3b30) : juce::Colour(0xff2bff6a);
+}
+
 void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& area) const
 {
     if (!display.valid || display.freq.empty())
         return;
+
+    const auto drawDecimatedLine = [this, &g, &area] (const std::vector<float>& values,
+                                                       const juce::Colour& colour,
+                                                       float thickness)
+    {
+        juce::Path path;
+        auto started = false;
+        const auto columns = juce::jmax (1, (int) std::ceil (area.getWidth()));
+
+        for (int column = 0; column < columns; ++column)
+        {
+            const auto leftX = area.getX() + area.getWidth() * (float) column / (float) columns;
+            const auto rightX = area.getX() + area.getWidth() * (float) (column + 1) / (float) columns;
+            const auto lowFrequency = frequencyAtX (leftX, area);
+            const auto highFrequency = frequencyAtX (rightX, area);
+            const auto first = std::lower_bound (display.freq.begin(), display.freq.end(), lowFrequency);
+            const auto last = std::upper_bound (first, display.freq.end(), highFrequency);
+
+            auto peakValue = -std::numeric_limits<float>::infinity();
+            auto peakFrequency = 0.0f;
+            for (auto bin = first; bin != last; ++bin)
+            {
+                const auto index = (size_t) (bin - display.freq.begin());
+                if (index < values.size() && std::isfinite (values[index])
+                    && values[index] > peakValue)
+                {
+                    peakValue = values[index];
+                    peakFrequency = *bin;
+                }
+            }
+
+            if (! std::isfinite (peakValue))
+                continue;
+
+            const auto x = frequencyToX (peakFrequency, area);
+            const auto y = valueToY (peakValue, area);
+            if (started)
+                path.lineTo (x, y);
+            else
+                path.startNewSubPath (x, y);
+            started = true;
+        }
+
+        g.setColour (colour);
+        g.strokePath (path, juce::PathStrokeType (thickness));
+    };
 
     if (peakHoldEnabled && peakHoldValues.size() == display.traces.size())
     {
@@ -1236,6 +1438,13 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
 
             if (values.size() != display.freq.size())
                 continue;
+
+            if (style == Style::Line && mode == Mode::SingleChannel
+                && values.size() > (size_t) std::ceil (area.getWidth() * 2.0f))
+            {
+                drawDecimatedLine (values, peakHoldColourFor (t), peakHoldThickness);
+                continue;
+            }
 
             juce::Path path;
 
@@ -1250,8 +1459,8 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
                     path.lineTo(x, y);
             }
 
-            g.setColour(display.traces[t].colour.withAlpha(0.45f));
-            g.strokePath(path, juce::PathStrokeType(1.0f));
+            g.setColour(peakHoldColourFor(t));
+            g.strokePath(path, juce::PathStrokeType(peakHoldThickness));
         }
     }
 
@@ -1260,6 +1469,13 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
     {
         if (trace.values == nullptr || trace.values->size() != display.freq.size())
             continue;
+
+        if (style == Style::Line && mode == Mode::SingleChannel
+            && trace.values->size() > (size_t) std::ceil (area.getWidth() * 2.0f))
+        {
+            drawDecimatedLine (*trace.values, trace.colour, 2.0f);
+            continue;
+        }
 
         if (barStyle && mode == Mode::SingleChannel)
         {
@@ -1312,7 +1528,7 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
 
             // A bin the reference never excited carries no transfer function, so the line
             // breaks there instead of drawing a run of zeros as if it were measured.
-            if (!display.binValid.empty() && display.binValid[i] == 0)
+            if (mode != Mode::SingleChannel && !display.binValid.empty() && display.binValid[i] == 0)
             {
                 started = false;
                 continue;
@@ -1350,46 +1566,6 @@ void FFTDisplay::drawTraces(juce::Graphics& g, const juce::Rectangle<float>& are
 
 void FFTDisplay::drawLevelReadout(juce::Graphics& g, const juce::Rectangle<float>& area) const
 {
-    const auto right = area.getRight() - 6.0f;
-    auto y = area.getBottom() - 42.0f;
-
-    // One line per channel, Mic first, so the reading matches the trace colours.
-    // Both figures are named explicitly: "RMS -37.7 / -2.4 dBFS" reads as a ratio
-    // at a glance, and "dBFS" at the end could be mistaken for the Peak alone.
-    const auto line = [] (const ChannelLevels& levels)
-    {
-        return "RMS " + juce::String (levels.rmsDb, 1)
-             + "    Peak " + juce::String (levels.peakDb, 1) + " dBFS";
-    };
-
-    const auto aboveFloor = [this] (const ChannelLevels& l)
-    {
-        return l.rmsDb > dsp::dbFloor + 1.0f || l.peakDb > dsp::dbFloor + 1.0f;
-    };
-
-    g.setFont (juce::Font (13.0f, juce::Font::bold));
-
-    if (levelsValid && aboveFloor (measLevels))
-    {
-        g.setColour (traceColourFor (0));
-        g.drawText (measurementLabel, area.getX() + 10.0f, y, 110.0f, 18.0f,
-                    juce::Justification::centredLeft);
-        g.setColour (mutedColour);
-        g.drawText ("RMS " + line (measLevels), area.getX() + 124.0f, y,
-                    area.getWidth() - 140.0f, 18.0f, juce::Justification::centredRight);
-        y += 19.0f;
-    }
-
-    if (generatorReference && aboveFloor (refLevels))
-    {
-        g.setColour (traceColourFor (1));
-        g.drawText (referenceLabel, area.getX() + 10.0f, y, 110.0f, 18.0f,
-                    juce::Justification::centredLeft);
-        g.setColour (mutedColour);
-        g.drawText ("RMS " + line (refLevels), area.getX() + 124.0f, y,
-                    area.getWidth() - 140.0f, 18.0f, juce::Justification::centredRight);
-    }
-
     // The delay line stays where it was, just above the plot edge.
     g.setFont (juce::Font (12.0f));
     g.setColour (mutedColour);
@@ -1399,7 +1575,6 @@ void FFTDisplay::drawLevelReadout(juce::Graphics& g, const juce::Rectangle<float
                                          : "Delay -- : perlu sinyal referensi di kanal lain"),
                area.getX() - 6.0f, area.getBottom() - 22.0f, area.getWidth() - 8.0f, 18.0f,
                juce::Justification::centredRight);
-    (void) right;
 }
 
 void FFTDisplay::drawCursor(juce::Graphics& g, const juce::Rectangle<float>& area)
@@ -1472,6 +1647,7 @@ void FFTDisplay::mouseDown(const juce::MouseEvent& event)
         menu.addItem(2, "Freeze", true, frozen);
         menu.addSeparator();
         menu.addItem(3, "Bersihkan Peak Hold");
+        menu.addItem(4, "Batas dB manual", true, rangeEditorsVisible);
         menu.addSeparator();
         menu.addItem(10, rangePresets[0].name);
         menu.addItem(11, rangePresets[1].name);
@@ -1489,12 +1665,16 @@ void FFTDisplay::mouseDown(const juce::MouseEvent& event)
                 setFrozen(!frozen);
             else if (selection == 3)
                 clearPeakHold();
+            else if (selection == 4)
+                setRangeEditorsVisible (!rangeEditorsVisible);
             else if (selection >= 10 && selection <= 15)
             {
                 const auto index = selection - 10;
                 topDb = rangePresets[index].top;
                 bottomDb = rangePresets[index].bottom;
                 rangeSelector.setSelectedId(index + 1, juce::dontSendNotification);
+                topDbEditor.setText (juce::String ((int) topDb), juce::dontSendNotification);
+                bottomDbEditor.setText (juce::String ((int) bottomDb), juce::dontSendNotification);
                 displayDirty = true;
                 repaint();
             }

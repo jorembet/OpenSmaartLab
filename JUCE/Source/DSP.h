@@ -128,6 +128,213 @@ namespace dsp
         }
     }
 
+    inline float wrapDeg(float phase)
+    {
+        auto wrapped = std::fmod (phase, 360.0f);
+
+        if (wrapped > 180.0f)
+            wrapped -= 360.0f;
+        else if (wrapped < -180.0f)
+            wrapped += 360.0f;
+
+        // A bin reported as +180 where the trend says -180 draws a vertical jump in the
+        // curve, so the boundary is resolved to one side rather than left ambiguous.
+        if (wrapped >= 180.0f)
+            wrapped = -180.0f;
+
+        return wrapped;
+    }
+
+    /** Speed of sound in dry air in metres per second, for a temperature in Celsius.
+
+        The familiar 343 m/s is the value at 20 degrees and only that: air carries sound about
+        0.6 m/s faster for every degree above it, so a warm room measured as though it were
+        cool reports a path length roughly 3 % short, which is most of a 10 cm error at the
+        distances a room measurement is read at. This is the usual linear approximation, which
+        holds well across the range a room occupies. */
+    inline float speedOfSoundMetresPerSecond(float temperatureC = 20.0f)
+    {
+        const auto clamped = juce::jlimit (-40.0f, 60.0f, temperatureC);
+        return 331.3f + 0.606f * clamped;
+    }
+
+    /** Path length in metres for a delay, given the speed of sound.
+
+        One way travel. A measurement taken with a microphone in a room is the sum of the path
+        to the source and the path back, so the figure describes a total path rather than a
+        distance to any one surface, and it is labelled as a path on screen. */
+    inline float distanceFromDelayMetres(float delaySamples, double sampleRate,
+                                         float temperatureC = 20.0f)
+    {
+        if (! std::isfinite (delaySamples) || sampleRate <= 0.0)
+            return 0.0f;
+
+        return (float) ((double) delaySamples / sampleRate)
+                   * speedOfSoundMetresPerSecond (temperatureC);
+    }
+
+    /** Smooths an unwrapped phase with a centred moving average.
+
+        A one-pole filter is the wrong tool here because it flattens the very gradient the
+        phase slope estimator reads. What matters is that a smoothed straight line stays
+        straight: a centred average leaves any linear trend exactly where it was and removes
+        only the curvature, which is why this is not a recursive filter.
+
+        Bins marked invalid stay at zero so a smoothed curve cannot invent a reading where the
+        measurement had none. */
+    inline std::vector<float> smoothUnwrappedPhase(const std::vector<float>& phase,
+                                                   const std::vector<char>& valid,
+                                                   int halfWidth = 2)
+    {
+        std::vector<float> smoothed (phase.size(), 0.0f);
+
+        if (phase.empty() || halfWidth < 0)
+            return smoothed;
+
+        const auto hasValidity = valid.size() == phase.size();
+        const auto isValid = [&] (size_t i) { return ! hasValidity || valid[i] != 0; };
+
+        for (size_t i = 0; i < phase.size(); ++i)
+        {
+            if (! isValid (i))
+                continue;
+
+            // The average is formed relative to the bin being smoothed and each contribution
+            // is unwrapped onto it first. Averaging the stored values directly would cancel
+            // towards zero wherever the curve crosses the branch cut, flattening exactly the
+            // part of the curve a reader is looking at.
+            double sum = 0.0;
+            int count = 0;
+
+            for (int offset = -halfWidth; offset <= halfWidth; ++offset)
+            {
+                const auto j = (long) i + offset;
+
+                if (j < 0 || j >= (long) phase.size() || ! isValid ((size_t) j))
+                    continue;
+
+                sum += unwrapDeg (phase[i], phase[(size_t) j]);
+                ++count;
+            }
+
+            if (count > 0)
+                smoothed[i] = (float) (sum / (double) count);
+        }
+
+        return smoothed;
+    }
+
+    /** A delay read off the slope of the phase.
+
+        A pure delay of t seconds rotates the phase by -360*f*t degrees, so the phase is a
+        straight line against frequency with a slope of -360*t degrees per hertz. Fitting that
+        line across every usable bin at once is what separates this from reading a delay off a
+        single bin: one bin only says what happened at that frequency, and by 1 kHz a five
+        millisecond delay has already turned two and a quarter times around. */
+    struct PhaseSlopeEstimate
+    {
+        float delaySamples = 0.0f;
+        float delayMs = 0.0f;
+        float slopeDegPerHz = 0.0f;
+        /** RMS departure from the fitted line, in degrees. A large value means the phase is
+            not a straight line, which is what reflections and a wrapped curve do to it, and
+            the estimate should not be leaned on when it is large. */
+        float scatterDeg = 0.0f;
+        int binsUsed = 0;
+        bool valid = false;
+    };
+
+    inline PhaseSlopeEstimate estimatePhaseSlopeDelay(
+        const std::vector<float>& frequencies,
+        const std::vector<float>& phaseUnwrappedDeg,
+        const std::vector<float>& coherence,
+        const std::vector<char>& binValid,
+        double sampleRate,
+        float lowFrequency = 100.0f,
+        float highFrequency = 10000.0f,
+        float minCoherence = 0.5f)
+    {
+        PhaseSlopeEstimate estimate;
+
+        if (frequencies.size() < 4 || frequencies.size() != phaseUnwrappedDeg.size()
+            || sampleRate <= 0.0)
+            return estimate;
+
+        // Every point would otherwise be weighted equally, so the bins worth fitting are
+        // gathered first. A bin that was never measured, or whose two signals did not agree,
+        // carries no phase worth trusting and would only bend the line towards zero.
+        std::vector<size_t> usable;
+
+        for (size_t i = 0; i < frequencies.size(); ++i)
+        {
+            if (frequencies[i] < lowFrequency || frequencies[i] > highFrequency)
+                continue;
+
+            if (binValid.size() == frequencies.size() && binValid[i] == 0)
+                continue;
+
+            if (! std::isfinite (phaseUnwrappedDeg[i]))
+                continue;
+
+            if (coherence.size() == frequencies.size() && coherence[i] < minCoherence)
+                continue;
+
+            usable.push_back (i);
+        }
+
+        estimate.binsUsed = (int) usable.size();
+
+        // Fewer than a dozen points cannot define a slope. Two points would fit any line at
+        // all, and the answer would be decided by which two bins happened to be kept.
+        if (usable.size() < 12)
+            return estimate;
+
+        double sumF = 0.0, sumP = 0.0;
+
+        for (auto i : usable)
+        {
+            sumF += frequencies[i];
+            sumP += phaseUnwrappedDeg[i];
+        }
+
+        const auto meanF = sumF / (double) usable.size();
+        const auto meanP = sumP / (double) usable.size();
+
+        double numerator = 0.0, denominator = 0.0;
+
+        for (auto i : usable)
+        {
+            const auto df = (double) frequencies[i] - meanF;
+            numerator += df * ((double) phaseUnwrappedDeg[i] - meanP);
+            denominator += df * df;
+        }
+
+        if (denominator <= 0.0)
+            return estimate;
+
+        const auto slope = numerator / denominator;
+        const auto delaySeconds = -slope / 360.0;
+
+        if (! std::isfinite (delaySeconds))
+            return estimate;
+
+        double sumSquares = 0.0;
+
+        for (auto i : usable)
+        {
+            const auto predicted = meanP + slope * ((double) frequencies[i] - meanF);
+            const auto residual = (double) phaseUnwrappedDeg[i] - predicted;
+            sumSquares += residual * residual;
+        }
+
+        estimate.slopeDegPerHz = (float) slope;
+        estimate.scatterDeg = (float) std::sqrt (sumSquares / (double) usable.size());
+        estimate.delaySamples = (float) (delaySeconds * sampleRate);
+        estimate.delayMs = (float) (delaySeconds * 1000.0);
+        estimate.valid = true;
+        return estimate;
+    }
+
     inline void smoothMagnitudeDb(const std::vector<float>& freq,
                                   const std::vector<float>& magnitudeDb,
                                   int octaveFraction,
@@ -290,9 +497,32 @@ namespace dsp
         float getBinFrequency(int index) const noexcept;
         float getCoherentGain() const noexcept { return coherentGain; }
 
+        /** Mean square of the analysis window.
+
+            A power taken from a windowed transform has to be divided by this to become the
+            sound's power. It is three eighths for a Hann window, and assuming that rather than
+            measuring it puts a fixed error into every level that a change of window would move
+            without anyone noticing. */
+        float getWindowMeanSquare() const noexcept { return windowMeanSquare; }
+
         void analyse(const float* block, Spectrum& target) const;
         float levelDb(const float* block, char weighting) const;
         float peakDb(const float* block) const;
+
+        /** An extra correction in dB to apply to every bin, empty for none.
+
+            This is how a microphone's frequency response reaches a broadband level. A
+            measurement capsule is not flat, and its own calibration file says how far off it
+            is at each frequency; without that correction a coloured microphone reports a
+            level that is wrong by however much its response happens to differ at the
+            frequencies the sound actually occupied. One number cannot stand in for it, because
+            the error depends on the spectrum rather than on the level. */
+        void setBinCorrectionDb(std::vector<float> correctionDb)
+        {
+            binCorrectionDb = std::move(correctionDb);
+        }
+
+        const std::vector<float>& getBinCorrectionDb() const noexcept { return binCorrectionDb; }
 
     private:
         void fillScratch(const float* block) const;
@@ -301,6 +531,10 @@ namespace dsp
         int numBins = 1;
         float sampleRate = 48000.0f;
         float coherentGain = 1.0f;
+        float windowMeanSquare = 1.0f;
+
+        /** Empty for no correction. One entry per bin when there is one. */
+        std::vector<float> binCorrectionDb;
 
         juce::dsp::FFT fft { 10 };
         juce::dsp::WindowingFunction<float> window { 1024, juce::dsp::WindowingFunction<float>::hann, false };
@@ -325,6 +559,57 @@ namespace dsp
             cross += r*m; rPower += r*r; mPower += m*m;
         }
         return (float) (std::abs(cross) / std::sqrt(std::max(1.0e-30, rPower*mPower)));
+    }
+
+    /** Normalised correlation of overlapping, delay-aligned raw samples.
+
+        The pointer form is what the live delay search uses, because it runs on every frame
+        from the ring buffer and copying two FFT-sized blocks into vectors first would cost
+        more than the search itself. Confidence is the same normalised cross correlation as
+        the vector overload below, and 0 for silence, so a peak cannot look believable when
+        there was nothing to correlate. */
+    inline float delayConfidence(const float* ref, const float* mic, int numSamples, int lag)
+    {
+        if (ref == nullptr || mic == nullptr || numSamples <= 0
+            || std::abs (lag) >= numSamples)
+            return 0.0f;
+
+        const auto count = numSamples - std::abs (lag);
+
+        // Too few overlapping samples to say anything: the correlation of a handful of points
+        // is decided by noise, and a delay search that trusts it would rotate the average on
+        // no evidence.
+        if (count < 128)
+            return 0.0f;
+
+        const auto r0 = std::max (0, -lag);
+        const auto m0 = std::max (0, lag);
+
+        double rMean = 0.0, mMean = 0.0;
+
+        for (int i = 0; i < count; ++i)
+        {
+            rMean += ref[r0 + i];
+            mMean += mic[m0 + i];
+        }
+
+        rMean /= count;
+        mMean /= count;
+
+        double cross = 0.0, rPower = 0.0, mPower = 0.0;
+
+        for (int i = 0; i < count; ++i)
+        {
+            // The means are removed first, or a constant offset in either signal would count
+            // as agreement at every lag and the peak would stop meaning anything.
+            const auto r = (double) ref[r0 + i] - rMean;
+            const auto m = (double) mic[m0 + i] - mMean;
+            cross += r * m;
+            rPower += r * r;
+            mPower += m * m;
+        }
+
+        return (float) (std::abs (cross) / std::sqrt (std::max (1.0e-30, rPower * mPower)));
     }
 
     inline constexpr float preferredMantissas[] = { 1.00f, 1.25f, 1.60f, 2.00f, 2.50f,
@@ -402,13 +687,41 @@ namespace dsp
                                                     float maxFrequency)
     {
         const auto fraction = juce::jmax(1, octaveFraction);
-        const auto intervals = (int) std::lround(std::log2(maxFrequency / minFrequency) * (float) fraction);
-        std::vector<float> centres;
-        centres.reserve((size_t) intervals + 1);
 
-        for (int i = 0; i <= intervals; ++i)
-            centres.push_back(labelFrequency(minFrequency * std::pow(2.0f, (float) i / (float) fraction),
-                                             fraction));
+        if (! (minFrequency > 0.0f) || ! (maxFrequency >= minFrequency))
+            return {};
+
+        const auto ratio = std::pow (2.0f, 1.0f / (float) fraction);
+
+        std::vector<float> centres;
+
+        // Walked rather than counted, because log2(max/min) * fraction is not a whole number
+        // and rounding it decides the count by accident. Over 20 Hz to 20 kHz at 1/24 octave it
+        // comes to 239.18, so a rounded count gives 240 bands and drops the top one. Walking
+        // until the series passes the top of the range and then pinning the last centre to
+        // maxFrequency gives the count the spacing implies: 11, 31, 61, 121 and 241. It also
+        // keeps the top band labelled 20 kHz rather than the 20.48 kHz the raw series reaches,
+        // which matters because that band would otherwise sit above the range the reader was
+        // told they were looking at.
+        auto frequency = minFrequency;
+
+        for (;;)
+        {
+            if (frequency > maxFrequency)
+                frequency = maxFrequency;
+
+            centres.push_back (labelFrequency (frequency, fraction));
+
+            if (frequency >= maxFrequency)
+                break;
+
+            frequency *= ratio;
+
+            // A ratio of 1 or a non-finite range would never terminate; the band count is
+            // bounded so a bad argument cannot hang the caller.
+            if (centres.size() > 4096)
+                break;
+        }
 
         return centres;
     }
@@ -428,6 +741,8 @@ namespace dsp
         // The lowest band stops at minFrequency rather than at DC. An audio interface
         // commonly sits a few mV off zero, and bin 0 carries that offset as large
         // energy, which would otherwise be read as the band's level.
+        size_t bin = 0;
+
         for (size_t band = 0; band < centres.size(); ++band)
         {
             const auto low = band == 0 ? minFrequency
@@ -435,9 +750,14 @@ namespace dsp
             const auto high = band + 1 >= centres.size() ? std::numeric_limits<float>::infinity()
                                                           : std::sqrt(centres[band] * centres[band + 1]);
 
-            for (size_t bin = 0; bin < frequencies.size(); ++bin)
-                if (frequencies[bin] >= low && frequencies[bin] < high)
-                    bands[band] = std::max(bands[band], magnitudes[bin]);
+            while (bin < frequencies.size() && frequencies[bin] < low)
+                ++bin;
+
+            while (bin < frequencies.size() && frequencies[bin] < high)
+            {
+                bands[band] = std::max (bands[band], magnitudes[bin]);
+                ++bin;
+            }
         }
 
         return bands;
@@ -619,6 +939,205 @@ namespace dsp
 
         return juce::String(std::max(1, juce::roundToInt(frequency)));
     }
+
+    /** Measures the amplitude of individual spectral lines in a block.
+
+        Anything defined in terms of particular tones rather than of a whole spectrum needs
+        this: intermodulation products, the leakage between two channels, the harmonic series.
+        All of them are one question with different frequencies, and answering it three ways
+        would mean three chances to be wrong in three different ways.
+
+        A line is measured by integrating the power across the window's main lobe rather than by
+        reading the nearest bin. That costs three bins and removes both of the errors a single
+        bin brings with it: the scalloping loss that a tone a fraction of a bin off centre would
+        otherwise suffer, and the leakage of the loudest neighbour into whatever was being asked
+        about. The powers come out on the same scale as a level reading, so they can be added
+        and divided without a fudge factor between them.
+    */
+    class SpectralLineMeter
+    {
+    public:
+        void prepare (double newSampleRate, int newFftSize)
+        {
+            // Held here rather than asked of the analyser, which does not expose the rate it
+            // was prepared at and only uses it internally.
+            rate = std::max (1.0, newSampleRate);
+            analyser.prepare ((float) rate, newFftSize);
+        }
+
+        double getSampleRate() const noexcept { return rate; }
+
+        /** Transforms a block, so the lines can be read from it. */
+        bool analyse (const float* block, int numSamples)
+        {
+            spectrum.data.clear();
+
+            if (block == nullptr || numSamples < analyser.getFftSize())
+                return false;
+
+            analyser.analyse (block, spectrum);
+
+            if (! spectrum.valid || spectrum.data.empty())
+                return false;
+
+            const auto numBins = (int) spectrum.data.size();
+            const auto windowScale = std::max (1.0e-6f, analyser.getWindowMeanSquare());
+
+            if (linePowerByBin.size() != (size_t) numBins)
+                linePowerByBin.assign ((size_t) numBins, 0.0);
+
+            // Everything but DC, on the same scale a level reading is on. DC is left out because
+            // an interface sitting a few millivolts off zero is a property of the converter and
+            // not of the signal being measured.
+            double total = 0.0;
+
+            for (int i = 1; i < numBins - 1; ++i)
+            {
+                const auto power = 2.0 * (double) std::norm (spectrum.data[(size_t) i]);
+                linePowerByBin[(size_t) i] = power
+                    / ((double) analyser.getFftSize() * (double) analyser.getFftSize()
+                       * (double) windowScale);
+                total += linePowerByBin[(size_t) i];
+            }
+
+            linePowerByBin[0] = 0.0;
+
+            if (numBins >= 2)
+                linePowerByBin[(size_t) (numBins - 1)] = 0.0;
+
+            totalPowerValue = total;
+            return true;
+        }
+
+        bool isValid() const noexcept { return ! linePowerByBin.empty() && totalPowerValue > 0.0; }
+
+        /** Power at one frequency, taking the main lobe either side of it. */
+        double linePower (double frequency) const
+        {
+            if (linePowerByBin.empty())
+                return 0.0;
+
+            const auto centre = (int) std::lround (frequency / binWidth());
+            const auto numBins = (int) linePowerByBin.size();
+            const auto low = juce::jmax (1, centre - mainLobeBins);
+            const auto high = juce::jmin (numBins - 2, centre + mainLobeBins);
+
+            double total = 0.0;
+
+            for (int i = low; i <= high; ++i)
+                total += linePowerByBin[(size_t) i];
+
+            return total;
+        }
+
+        /** Power at one frequency, taking the loudest bin within a search radius first.
+
+            Used where the exact frequency is predicted but the peak may sit a bin or two away,
+            as happens for an intermodulation product derived from a fundamental that was itself
+            found rather than given. */
+        double linePowerNear (double frequency, double radiusHz) const
+        {
+            if (linePowerByBin.empty())
+                return 0.0;
+
+            const auto centre = frequency / binWidth();
+            const auto numBins = (int) linePowerByBin.size();
+            const auto low = juce::jmax (1, (int) std::floor (centre - radiusHz / binWidth()));
+            const auto high = juce::jmin (numBins - 2, (int) std::ceil (centre + radiusHz / binWidth()));
+
+            auto bestBin = juce::jlimit (1, numBins - 2, (int) std::lround (centre));
+
+            for (int i = low; i <= high; ++i)
+                if (linePowerByBin[(size_t) i] > linePowerByBin[(size_t) bestBin])
+                    bestBin = i;
+
+            const auto half = juce::jmax (1, mainLobeBins);
+            const auto from = juce::jmax (1, bestBin - half);
+            const auto to = juce::jmin (numBins - 2, bestBin + half);
+
+            double total = 0.0;
+
+            for (int i = from; i <= to; ++i)
+                total += linePowerByBin[(size_t) i];
+
+            return total;
+        }
+
+        /** Power across everything except DC. */
+        double totalPower() const noexcept { return totalPowerValue; }
+
+        struct Peak
+        {
+            double frequency = 0.0;
+            double power = 0.0;
+            int bin = 0;
+            bool valid = false;
+        };
+
+        /** The strongest line in a range, refined to a fraction of a bin.
+
+            The refinement is a parabola through the peak and its neighbours in decibels, which
+            is what lets every intermodulation product be placed from the fundamental rather than
+            from a rounded number of bins per hertz. */
+        Peak findPeak (double lowHz, double highHz) const
+        {
+            Peak peak;
+
+            if (linePowerByBin.empty())
+                return peak;
+
+            const auto numBins = (int) linePowerByBin.size();
+            const auto low = juce::jmax (1, (int) std::ceil (lowHz / binWidth()));
+            const auto high = juce::jmin (numBins - 2, (int) std::floor (highHz / binWidth()));
+
+            if (high <= low)
+                return peak;
+
+            auto best = low;
+
+            for (int i = low; i <= high; ++i)
+                if (linePowerByBin[(size_t) i] > linePowerByBin[(size_t) best])
+                    best = i;
+
+            auto fractional = (double) best;
+
+            if (best > low && best < high)
+            {
+                const auto leftDb = 10.0 * std::log10 (std::max (1.0e-30, linePowerByBin[(size_t) (best - 1)]));
+                const auto midDb = 10.0 * std::log10 (std::max (1.0e-30, linePowerByBin[(size_t) best]));
+                const auto rightDb = 10.0 * std::log10 (std::max (1.0e-30, linePowerByBin[(size_t) (best + 1)]));
+
+                const auto denominator = leftDb - 2.0 * midDb + rightDb;
+
+                if (std::abs (denominator) > 1.0e-9)
+                    fractional += juce::jlimit (-0.5, 0.5, 0.5 * (leftDb - rightDb) / denominator);
+            }
+
+            peak.bin = best;
+            peak.power = linePowerNear (fractional * binWidth(), (double) mainLobeBins * binWidth());
+            peak.frequency = fractional * binWidth();
+            peak.valid = peak.power > 0.0;
+            return peak;
+        }
+
+        double binWidth() const noexcept
+        {
+            return analyser.getFftSize() > 0 ? rate / (double) analyser.getFftSize() : 0.0;
+        }
+
+        /** Bins either side of a peak that are taken as part of its line.
+
+            Three covers a Hann main lobe whole. Wider would begin to swallow the noise floor
+            into whatever is being measured and report it as signal. */
+        static constexpr int mainLobeBins = 2;
+
+    private:
+        BlockAnalyser analyser;
+        Spectrum spectrum;
+        mutable std::vector<double> linePowerByBin;
+        double totalPowerValue = 0.0;
+        double rate = 48000.0;
+    };
 
     class DelayFinder
     {

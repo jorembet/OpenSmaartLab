@@ -37,8 +37,29 @@ public:
     /** Coherence below this makes the measurement unusable rather than merely uneven. */
     static constexpr float validityThreshold = 0.8f;
 
+    /** Fewest averages that can tell a coherent pair from an unrelated one.
+
+        Coherence is a ratio of averaged spectra, and for a single frame it is identically
+        one: |conj(X)Y|^2 = |X|^2|Y|^2, so two signals with nothing in common read a perfect
+        1.0. Averaging N frames pulls the reading for unrelated signals down towards 1/N, so
+        the estimate only carries information once 1/N sits well under the threshold. Below
+        this many averages the number is arithmetically correct and completely uninformative,
+        and reporting it as confidence would be the worst kind of wrong: it would reassure
+        the reader about a measurement that proved nothing. */
+    static constexpr int minimumTrustworthyAverages = 4;
+
+    /** True when the average is deep enough for the coherence to mean anything. */
+    static bool isCoherenceTrustworthy (int averages)
+    {
+        return averages >= minimumTrustworthyAverages;
+    }
+
     bool hasData() const { return !frequency.empty(); }
     float getAverageCoherence() const { return averageCoherence; }
+    float getMeasuredRmsDb() const { return measRmsDb; }
+    float getMeasuredPeakDb() const { return measPeakDb; }
+    float getReferenceRmsDb() const { return refRmsDb; }
+    float getReferencePeakDb() const { return refPeakDb; }
     juce::String getReadout() const;
 
     std::function<void()> onFindDelay;
@@ -60,7 +81,11 @@ private:
     void drawAxis(juce::Graphics& g, const juce::Rectangle<float>& bounds,
                   float top, float bottom, const juce::String& unit);
     void drawFrequencyLabels(juce::Graphics& g, const juce::Rectangle<float>& bounds);
+    void drawLevelSidebar(juce::Graphics& g);
+    void drawEqCorrection(juce::Graphics& g, const juce::Rectangle<float>& bounds) const;
+    void computeEqTarget();
     Panes panes() const;
+    juce::Rectangle<float> sidebarArea() const;
     float frequencyToX(float frequency, const juce::Rectangle<float>& bounds) const;
     float xToFrequency(float x, const juce::Rectangle<float>& bounds) const;
     juce::Rectangle<float> magnitudeArea() const;
@@ -77,13 +102,28 @@ private:
     float delayMs = 0.0f;
     float averageCoherence = 0.0f;
     float peakReferenceDb = dsp::dbFloor;
+    float measRmsDb = dsp::dbFloor;
+    float measPeakDb = dsp::dbFloor;
+    float refRmsDb = dsp::dbFloor;
+    float refPeakDb = dsp::dbFloor;
     int validBins = 0;
     int blankedBins = 0;
+    /** Averages behind the current reading, which is what decides whether the coherence can
+        be believed. Carried here because the banner has to explain a low coherence, and
+        "too few averages to tell" is a different answer from "the two signals disagree". */
+    int averages = 1;
     bool delayAvailable = false;
     bool frozen = false;
+    bool showEqOverlay = false;
+    // The level a flat correction aims at, and how much correction is allowed at most.
+    // Anything beyond that is a measurement artefact, not a room.
+    float eqTargetDb = 0.0f;
+    bool eqTargetValid = false;
+    static constexpr float maxCorrectionDb = 12.0f;
 
     juce::TextButton findDelayButton { "Cari Delay" };
     juce::TextButton freezeButton { "Freeze" };
+    juce::TextButton eqOverlayButton { "Koreksi EQ" };
     juce::Label validityLabel;
     juce::Label readoutLabel;
 

@@ -1,38 +1,31 @@
 #include "GeneratorDisplay.h"
 #include "DSP.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace
 {
-    const juce::Colour backgroundColour = juce::Colour(0xff111318);
-    const juce::Colour panelColour = juce::Colour(0xff1b1f27);
-    const juce::Colour gridColour = juce::Colour(0xff232833);
-    const juce::Colour gridBoldColour = juce::Colour(0xff39404f);
+    const juce::Colour backgroundColour = juce::Colour(0xff1d1d1d);
+    const juce::Colour panelColour = juce::Colour(0xff262626);
+    const juce::Colour plotColour = juce::Colour(0xff050505);
+    const juce::Colour gridColour = juce::Colour(0xff383838);
+    const juce::Colour gridBoldColour = juce::Colour(0xff555555);
     const juce::Colour textColour = juce::Colour(0xffe6e9ef);
-    const juce::Colour mutedColour = juce::Colour(0xff8892a0);
+    const juce::Colour mutedColour = juce::Colour(0xff9a9a9a);
     const juce::Colour waveColour = juce::Colour(0xff4fc3f7);
     const juce::Colour spectrumColour = juce::Colour(0xffffb74d);
     const juce::Colour runningColour = juce::Colour(0xff43a047);
     const juce::Colour stoppedColour = juce::Colour(0xffe53935);
     const juce::Colour bandShadeColour = juce::Colour(0xff262c3a);
 
-    constexpr int analysisSize = 4096;
+    constexpr int minimumAnalysisSize = 4096;
+    constexpr int maximumAnalysisSize = 32768;
 }
 
 GeneratorDisplay::GeneratorDisplay()
 {
-    scratch.assign((size_t) analysisSize * 2, 0.0f);
-    fft = juce::dsp::FFT(juce::roundToInt(std::log2((double) analysisSize)));
-    window.fillWindowingTables(analysisSize, juce::dsp::WindowingFunction<float>::hann, false);
-
-    std::vector<float> probe((size_t) analysisSize, 1.0f);
-    window.multiplyWithWindowingTable(probe.data(), analysisSize);
-
-    double total = 0.0;
-
-    for (auto value : probe)
-        total += value;
-
-    coherentGain = (float) (total / analysisSize);
+    prepareAnalysisSize (analysisSize);
 
     setInterceptsMouseClicks(false, false);
 }
@@ -55,6 +48,7 @@ void GeneratorDisplay::setSignal(const juce::String& newType, float newLevelDb,
     levelDb = newLevelDb;
     sweepProgress = newSweepProgress;
     outputDevice = device;
+    updateAnalysisSize();
     repaint();
 }
 
@@ -67,6 +61,7 @@ void GeneratorDisplay::setGeneratorSettings(float newBandLow, float newBandHigh,
     toneFrequency = std::max(1.0f, newToneFrequency);
     sweepStart = std::max(1.0f, newSweepStart);
     sweepEnd = std::max(sweepStart, newSweepEnd);
+    updateAnalysisSize();
     repaint();
 }
 
@@ -85,6 +80,7 @@ void GeneratorDisplay::setSamples(const std::vector<float>& newSamples, float ne
 {
     samples = newSamples;
     sampleRate = std::max(1000.0f, newSampleRate);
+    updateAnalysisSize();
 
     peak = 0.0f;
     double sum = 0.0;
@@ -100,6 +96,47 @@ void GeneratorDisplay::setSamples(const std::vector<float>& newSamples, float ne
     analyse();
     updateSlope();
     repaint();
+}
+
+void GeneratorDisplay::prepareAnalysisSize (int size)
+{
+    analysisSize = size;
+    scratch.assign ((size_t) analysisSize * 2, 0.0f);
+    fft = juce::dsp::FFT (juce::roundToInt (std::log2 ((double) analysisSize)));
+    window.fillWindowingTables (analysisSize, juce::dsp::WindowingFunction<float>::hann, false);
+
+    std::vector<float> probe ((size_t) analysisSize, 1.0f);
+    window.multiplyWithWindowingTable (probe.data(), analysisSize);
+
+    double total = 0.0;
+    for (const auto value : probe)
+        total += value;
+
+    coherentGain = (float) (total / analysisSize);
+}
+
+void GeneratorDisplay::updateAnalysisSize()
+{
+    auto lowestFrequency = 20.0f;
+
+    if (type.contains ("Pink"))
+        lowestFrequency = bandLow;
+    else if (type.contains ("Sine") || type.contains ("Square")
+             || type.contains ("Triangle") || type.contains ("Saw"))
+        lowestFrequency = toneFrequency;
+    else if (type.contains ("Sweep"))
+        lowestFrequency = sweepStart;
+
+    // Resolve at least eight periods near the bottom of the selected range. A fixed
+    // 4096 point FFT had almost no useful resolution for a 20 Hz tone or the bass end of
+    // pink noise, so those settings displayed a peak at the wrong frequency or no peak.
+    const auto required = (int) std::ceil (sampleRate * 8.0 / std::max (1.0f, lowestFrequency));
+    auto newSize = minimumAnalysisSize;
+    while (newSize < required && newSize < maximumAnalysisSize)
+        newSize *= 2;
+
+    if (newSize != analysisSize)
+        prepareAnalysisSize (newSize);
 }
 
 void GeneratorDisplay::analyse()
@@ -327,20 +364,79 @@ void GeneratorDisplay::drawWaveform(juce::Graphics& g, const juce::Rectangle<flo
     if (samples.size() < 4)
         return;
 
-    const auto scale = peak > 1.0e-9f ? plot.getHeight() * 0.45f / peak : 0.0f;
+    auto visibleCount = (int) samples.size();
+    auto visibleFrequency = 0.0f;
+
+    if (type.contains ("Sine") || type.contains ("Square")
+        || type.contains ("Triangle") || type.contains ("Saw"))
+        visibleFrequency = toneFrequency;
+    else if (type.contains ("Sweep"))
+        visibleFrequency = sweepStart * std::pow (sweepEnd / sweepStart,
+                                                   juce::jlimit (0.0f, 1.0f, sweepProgress));
+
+    // Show a few cycles of a tone instead of squeezing hundreds of cycles into one
+    // screen width. Broadband signals keep their full captured window so their shape
+    // remains representative.
+    if (visibleFrequency > 0.0f)
+    {
+        const auto cycles = juce::roundToInt (sampleRate * 3.0f / visibleFrequency);
+        visibleCount = std::min (visibleCount, juce::jmax (64, cycles));
+    }
+
+    const auto firstSample = (int) samples.size() - visibleCount;
+    auto windowPeak = 0.0f;
+    for (int i = firstSample; i < (int) samples.size(); ++i)
+        windowPeak = std::max (windowPeak, std::abs (samples[(size_t) i]));
+
+    if (windowPeak <= 1.0e-9f)
+    {
+        g.setColour (mutedColour);
+        g.setFont (juce::Font (14.0f));
+        g.drawText ("Output senyap - cek mute dan routing speaker", plot,
+                    juce::Justification::centred);
+        return;
+    }
+
+    const auto scale = plot.getHeight() * 0.45f / windowPeak;
+    const auto columns = juce::jmax (1, (int) std::ceil (plot.getWidth()));
 
     juce::Path path;
-    const auto count = (int) samples.size();
-
-    for (int i = 0; i < count; ++i)
+    if (visibleCount > columns * 2)
     {
-        const auto x = plot.getX() + plot.getWidth() * (float) i / (float) count;
-        const auto y = centre - samples[(size_t) i] * scale;
+        // Reduce dense waveforms to the graph's pixel width while preserving peaks.
+        for (int column = 0; column < columns; ++column)
+        {
+            const auto begin = firstSample + (int) ((int64_t) column * visibleCount / columns);
+            const auto end = firstSample + (int) ((int64_t) (column + 1) * visibleCount / columns);
+            auto minimum = std::numeric_limits<float>::infinity();
+            auto maximum = -std::numeric_limits<float>::infinity();
 
-        if (i == 0)
-            path.startNewSubPath(x, y);
-        else
-            path.lineTo(x, y);
+            for (auto i = begin; i < std::max (begin + 1, end); ++i)
+            {
+                const auto value = samples[(size_t) std::min (i, (int) samples.size() - 1)];
+                minimum = std::min (minimum, value);
+                maximum = std::max (maximum, value);
+            }
+
+            const auto x = plot.getX() + plot.getWidth() * ((float) column + 0.5f)
+                                                    / (float) columns;
+            path.startNewSubPath (x, centre - maximum * scale);
+            path.lineTo (x, centre - minimum * scale);
+        }
+    }
+    else
+    {
+        for (int i = 0; i < visibleCount; ++i)
+        {
+            const auto x = plot.getX() + plot.getWidth() * (float) i
+                                            / (float) std::max (1, visibleCount - 1);
+            const auto y = centre - samples[(size_t) (firstSample + i)] * scale;
+
+            if (i == 0)
+                path.startNewSubPath (x, y);
+            else
+                path.lineTo (x, y);
+        }
     }
 
     g.setColour(waveColour);
@@ -348,7 +444,7 @@ void GeneratorDisplay::drawWaveform(juce::Graphics& g, const juce::Rectangle<flo
 
     g.setColour(mutedColour);
     g.setFont(juce::Font(12.0f));
-    g.drawText("Waveform " + juce::String((int) (samples.size() / std::max(1.0f, sampleRate) * 1000.0f))
+    g.drawText("Waveform " + juce::String((int) (visibleCount / std::max(1.0f, sampleRate) * 1000.0f))
                    + " ms terakhir",
                plot.withY(plot.getY() - 22.0f).withHeight(20.0f),
                juce::Justification::left);
@@ -406,6 +502,15 @@ void GeneratorDisplay::drawSpectrum(juce::Graphics& g, const juce::Rectangle<flo
     if (!spectrum.valid)
         return;
 
+    if (peak <= 1.0e-9f)
+    {
+        g.setColour (mutedColour);
+        g.setFont (juce::Font (14.0f));
+        g.drawText ("Output senyap - cek mute dan routing speaker", plot,
+                    juce::Justification::centred);
+        return;
+    }
+
     auto topDb = -20.0f;
     auto bottomDb = -110.0f;
 
@@ -428,30 +533,64 @@ void GeneratorDisplay::drawSpectrum(juce::Graphics& g, const juce::Rectangle<flo
     bottomDb = std::max(bottomDb, topDb - 90.0f);
 
     juce::Path path;
-    bool started = false;
-
-    for (size_t i = 0; i < spectrum.freq.size(); ++i)
+    auto started = false;
+    const auto columns = juce::jmax (1, (int) std::ceil (plot.getWidth()));
+    if (spectrum.freq.size() > (size_t) columns * 2)
     {
-        const auto freq = spectrum.freq[i];
-
-        if (freq < view.low)
-            continue;
-
-        if (freq > view.high)
-            break;
-
-        const auto x = toX(freq);
-        const auto fraction = juce::jlimit(0.0f, 1.0f, (spectrum.magnitudeDb[i] - bottomDb) / (topDb - bottomDb));
-        const auto y = plot.getBottom() - fraction * plot.getHeight();
-
-        if (!started)
+        for (int column = 0; column < columns; ++column)
         {
-            path.startNewSubPath(x, y);
-            started = true;
+            const auto lowFrequency = std::pow (10.0f, logLow + logSpan * (float) column
+                                                               / (float) columns);
+            const auto highFrequency = std::pow (10.0f, logLow + logSpan * (float) (column + 1)
+                                                                / (float) columns);
+            const auto first = std::lower_bound (spectrum.freq.begin(), spectrum.freq.end(), lowFrequency);
+            const auto last = std::upper_bound (first, spectrum.freq.end(), highFrequency);
+            auto strongest = first;
+
+            for (auto bin = first; bin != last; ++bin)
+                if (spectrum.magnitudeDb[(size_t) (bin - spectrum.freq.begin())]
+                    > spectrum.magnitudeDb[(size_t) (strongest - spectrum.freq.begin())])
+                    strongest = bin;
+
+            if (strongest == last)
+                continue;
+
+            const auto freq = *strongest;
+            const auto fraction = juce::jlimit (0.0f, 1.0f,
+                (spectrum.magnitudeDb[(size_t) (strongest - spectrum.freq.begin())] - bottomDb)
+                    / (topDb - bottomDb));
+            const auto x = toX (freq);
+            const auto y = plot.getBottom() - fraction * plot.getHeight();
+
+            if (! started)
+            {
+                path.startNewSubPath (x, y);
+                started = true;
+            }
+            else
+                path.lineTo (x, y);
         }
-        else
+    }
+    else
+    {
+        for (size_t i = 0; i < spectrum.freq.size(); ++i)
         {
-            path.lineTo(x, y);
+            const auto freq = spectrum.freq[i];
+            if (freq < view.low || freq > view.high)
+                continue;
+
+            const auto x = toX (freq);
+            const auto fraction = juce::jlimit (0.0f, 1.0f,
+                (spectrum.magnitudeDb[i] - bottomDb) / (topDb - bottomDb));
+            const auto y = plot.getBottom() - fraction * plot.getHeight();
+
+            if (! started)
+            {
+                path.startNewSubPath (x, y);
+                started = true;
+            }
+            else
+                path.lineTo (x, y);
         }
     }
 
@@ -506,7 +645,7 @@ void GeneratorDisplay::paint(juce::Graphics& g)
     drawHeader(g, area.removeFromTop(64.0f));
     area.removeFromTop(12.0f);
 
-    g.setColour(panelColour);
+    g.setColour(plotColour);
 
     const auto waveBounds = waveformArea();
     const auto spectrumBounds = spectrumArea();

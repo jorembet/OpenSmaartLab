@@ -3,18 +3,26 @@
 
 namespace
 {
-    const juce::Colour backgroundColour = juce::Colour(0xff111318);
-    const juce::Colour barColour = juce::Colour(0xff1b1f27);
+    const juce::Colour backgroundColour = juce::Colour(0xff1d1d1d);
+    const juce::Colour barColour = juce::Colour(0xff262626);
     const juce::Colour textColour = juce::Colour(0xffe6e9ef);
-    const juce::Colour mutedColour = juce::Colour(0xff8892a0);
+    const juce::Colour mutedColour = juce::Colour(0xff9a9a9a);
     const juce::Colour runningColour = juce::Colour(0xff43a047);
     const juce::Colour stoppedColour = juce::Colour(0xffe53935);
+
+    void applyInputGain (std::vector<float>& samples, float gain)
+    {
+        if (gain == 1.0f)
+            return;
+
+        for (auto& sample : samples)
+            sample *= gain;
+    }
 }
 
 MainComponent::MainComponent()
 {
     setSize(1480, 920);
-    generatorDelayFinder.prepare(65536);
     pinkNoiseButton.onClick = [this] { playPinkNoise(); };
     pinkNoiseLevel.setRange(-60.0, -3.0, 0.5);
     pinkNoiseLevel.setValue(-24.0, juce::dontSendNotification);
@@ -23,12 +31,80 @@ MainComponent::MainComponent()
     pinkNoiseLevel.setTextBoxStyle(juce::Slider::TextBoxRight, false, 85, 24);
     pinkNoiseLevel.setTooltip("Level pink noise yang dikirim ke perangkat Output / Putar");
     pinkNoiseLevel.onValueChange = [this] { generatorLevelSlider.setValue(pinkNoiseLevel.getValue()); };
+
+    inputGainLabel.setFont (juce::Font (13.0f));
+    inputGainLabel.setColour (juce::Label::textColourId, textColour);
+    inputGainSlider.setRange (-60.0, 24.0, 0.5);
+    inputGainSlider.setValue (0.0, juce::dontSendNotification);
+    inputGainSlider.setTextValueSuffix (" dB");
+    inputGainSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    inputGainSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 70, 24);
+    inputGainSlider.setDoubleClickReturnValue (true, 0.0);
+    inputGainSlider.setTooltip ("Mengatur volume input mikrofon; memakai gain hardware bila tersedia, jika tidak memakai trim digital.");
+    inputGainSlider.onValueChange = [this]
+    {
+        const auto requestedDb = (float) inputGainSlider.getValue();
+        if (hardwareInputGainActive)
+        {
+            const auto previous = audioEngine.getHardwareInputGainInfo().currentDb;
+            if (audioEngine.setHardwareInputGainDb (requestedDb))
+            {
+                const auto applied = audioEngine.getHardwareInputGainInfo().currentDb;
+                inputGainSlider.setValue (applied, juce::dontSendNotification);
+                inputLevelPanel.setInputGainControl (
+                    audioEngine.getHardwareInputGainInfo().minimumDb,
+                    audioEngine.getHardwareInputGainInfo().maximumDb, applied, true);
+                if (microphoneCalibration.hasCalibration())
+                {
+                    microphoneCalibration.setInputTrimDb (
+                        microphoneCalibration.getInputTrimDb()
+                        + previous - applied);
+                    applyCalibrationToSplMeter();
+                }
+            }
+            else
+            {
+                // A mixer can disappear or become inaccessible while the capture PCM stays
+                // open. Keep the same control usable by falling back to the analysis trim.
+                hardwareInputGainActive = false;
+                softwareInputGainDb = requestedDb;
+                inputGainLabel.setText ("Trim Mic", juce::dontSendNotification);
+                inputGainSlider.setRange (-60.0, 24.0, 0.5);
+                inputGainSlider.setValue (softwareInputGainDb, juce::dontSendNotification);
+                inputLevelPanel.setInputGainControl (-60.0, 24.0, softwareInputGainDb, false);
+                inputGainSlider.setTooltip ("Trim digital untuk analisis mikrofon; kontrol hardware tidak tersedia.");
+                statusLabel.setText ("Gain hardware tidak tersedia; memakai trim digital",
+                                     juce::dontSendNotification);
+            }
+        }
+        else
+        {
+            softwareInputGainDb = requestedDb;
+            inputLevelPanel.setInputGainControl (-60.0, 24.0,
+                                                 softwareInputGainDb, false);
+        }
+
+        dspWorker.resetAveraging();
+        transferFunction.reset();
+        referenceFrames = 0;
+    };
+    inputLevelPanel.onInputGainChanged = [this] (float requestedDb)
+    {
+        inputGainSlider.setValue (requestedDb);
+    };
     addAndMakeVisible(pinkNoiseButton);
     addAndMakeVisible(pinkNoiseLevel);
+    addAndMakeVisible (inputGainLabel);
+    addAndMakeVisible (inputGainSlider);
     addAndMakeVisible(pinkNoiseHint);
+    addAndMakeVisible(startHintLabel);
+    startHintLabel.setColour(juce::Label::textColourId, mutedColour);
+    startHintLabel.setFont(juce::Font(13.0f));
+    startHintLabel.setJustificationType(juce::Justification::centredLeft);
 
     audioEngine.onStatusMessage = [this] (const juce::String& text)
     {
+        engineStatusMessage = text;
         statusLabel.setText(text, juce::dontSendNotification);
     };
 
@@ -57,22 +133,45 @@ MainComponent::MainComponent()
         transferFunction.setAveraging(averagingSelector.getSelectedId());
     };
 
+    // The temperatures a room is actually held at. 20 is the default because it is the value
+    // the 343 m/s figure everybody quotes belongs to, and it is the one a measurement made
+    // without a thermometer is implicitly assuming.
+    temperatureSelector.addItem ("Suhu 15 C", 15);
+    temperatureSelector.addItem ("Suhu 18 C", 18);
+    temperatureSelector.addItem ("Suhu 20 C", 20);
+    temperatureSelector.addItem ("Suhu 22 C", 22);
+    temperatureSelector.addItem ("Suhu 25 C", 25);
+    temperatureSelector.addItem ("Suhu 28 C", 28);
+    temperatureSelector.addItem ("Suhu 30 C", 30);
+    temperatureSelector.setSelectedId (20);
+    temperatureSelector.setTooltip (" Suhu udara, untuk mengubah delay menjadi jarak");
+    temperatureSelector.onChange = [this]
+    {
+        transferFunction.setTemperature ((float) temperatureSelector.getSelectedId());
+        // The distance is derived from the temperature, so the readout has to be recomputed
+        // even though nothing about the measurement itself has changed.
+        referenceFrames = 0;
+    };
+    addAndMakeVisible (temperatureSelector);
+
     inputSelector.onChange = [this] { inputSelector.setTooltip(inputSelector.getText()); };
     outputSelector.onChange = [this] { outputSelector.setTooltip(outputSelector.getText()); };
-    sampleRateSelector.onChange = [this] { };
-    bufferSizeSelector.onChange = [this] { };
-
-    refreshButton.onClick = [this]
-    {
-        audioEngine.scanDevices();
-        refreshDeviceSelectors();
-    };
+sampleRateSelector.onChange = [this] { applyAudioSettingsToDevice(); };
+bufferSizeSelector.onChange = [this] { applyAudioSettingsToDevice(); };
 
     startStopButton.onClick = [this] { startStopClicked(); };
     exportButton.onClick = [this] { exportCSVClicked(); };
+    exportIrButton.onClick = [this] { exportIrClicked(); };
     calibrationButton.onClick = [this] { calibrationMenuClicked(); };
+    splMeter.onCalibrationRequested = [this] { runCalibratorWorkflow(); };
     saveSnapshotButton.onClick = [this] { saveSnapshotClicked(); };
     loadSnapshotButton.onClick = [this] { loadSnapshotClicked(); };
+    // Start is the one control that has to be found and pressed first, so it carries its own
+    // colour state instead of the toolbar's flat buttons.
+    startStopButton.setTooltip ("Mulai atau hentikan penangkapan audio");
+    startStopButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+    startStopButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    addAndMakeVisible (startStopButton);
     addAndMakeVisible (calibrationButton);
     addAndMakeVisible (saveSnapshotButton);
     addAndMakeVisible (loadSnapshotButton);
@@ -80,8 +179,8 @@ MainComponent::MainComponent()
     calibrationLabel.setColour (juce::Label::textColourId, mutedColour);
     calibrationLabel.setJustificationType (juce::Justification::centredLeft);
     addAndMakeVisible (calibrationLabel);
-    calibrationButton.setTooltip ("Kalibrasi mikrofon: pilih model, muat kurva CSV, atau matikan\n"
-                                 "Kalibrasi hanya diterapkan pada kanal Mic pada mode RTA Microphone");
+    calibrationButton.setTooltip ("Kelola profil mic: kalibrasi dengan acoustic calibrator, pilih model, "
+                                  "muat kurva, atau matikan kalibrasi.");
     saveSnapshotButton.setTooltip ("Simpan hasil RTA sekarang ke folder Documents/OpenSmaartLab/RTA");
     loadSnapshotButton.setTooltip ("Muat kembali hasil RTA yang tersimpan, atau kembali ke RTA langsung");
     // Calibration stays off by default. Turning it on converts dBFS into dB SPL,
@@ -128,9 +227,8 @@ MainComponent::MainComponent()
     addAndMakeVisible(bufferSizeSelector);
     addAndMakeVisible(fftSizeSelector);
     addAndMakeVisible(averagingSelector);
-    addAndMakeVisible(refreshButton);
-    addAndMakeVisible(startStopButton);
     addAndMakeVisible(exportButton);
+    addAndMakeVisible(exportIrButton);
     addAndMakeVisible(statusLabel);
     addAndMakeVisible(delayLabel);
     addAndMakeVisible(coherenceLabel);
@@ -142,7 +240,6 @@ MainComponent::MainComponent()
         const auto name = generatorTypeSelector.getText();
         auto& generator = audioEngine.getGenerator();
         generator.setType(SignalGenerator::typeFromName(name));
-        generatorDelayValid = false;
         transferFunction.reset();
         updateGeneratorGeneratorControls();
         updateGeneratorInfo();
@@ -214,7 +311,11 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
         updateGeneratorInfo();
     };
 
-    generatorSweepDurationSlider.setRange(1.0, 60.0, 0.5);
+    generatorSweepDurationSlider.setRange(5.0, 60.0, 5.0);
+
+    // The interval is the snap, so a five second step puts the dial on the durations a sweep
+    // is actually run at: 5, 10 and 20. A continuous dial looked more flexible and only ever
+    // produced odd lengths like 12.5 s, which nobody sweeps with.
     generatorSweepDurationSlider.setValue(10.0, juce::dontSendNotification);
     generatorSweepDurationSlider.setTextValueSuffix(" s");
     generatorSweepDurationSlider.onValueChange = [this]
@@ -301,6 +402,22 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
 
     generatorButton.onClick = [this] { generatorToggled(); };
 
+    // Mute is not the same as switching off. Stopping tears the session down and forgets the
+    // waveform; muting keeps it running and only silences the output, so the level, the band
+    // and the frequency are all still exactly where they were when it comes back.
+    generatorMuteButton.setClickingTogglesState (true);
+    generatorMuteButton.setTooltip ("Bisukan generator tanpa mengubah pengaturan");
+    generatorMuteButton.onClick = [this]
+    {
+        audioEngine.getGenerator().setMuted (generatorMuteButton.getToggleState());
+
+        // Same reason as switching the generator on or off: the average would otherwise carry
+        // the level from before the mute, and coming back from a mute should show the new level
+        // straight away rather than easing into it.
+        dspWorker.resetAveraging();
+    };
+    addAndMakeVisible (generatorMuteButton);
+
     generatorPanel.addAndMakeVisible(generatorButton);
     generatorPanel.addAndMakeVisible(generatorTypeSelector);
     generatorPanel.addAndMakeVisible(generatorLevelSlider);
@@ -332,8 +449,15 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     tabs.addTab("Transfer Function", backgroundColour, &transferFunctionDisplay, false);
     transferFunctionDisplay.onFindDelay = [this] { findDelayRequested = true; };
     tabs.addTab("Reverberation", backgroundColour, &reverbDisplay, false);
+    tabs.addTab("Impedansi", backgroundColour, &impedanceDisplay, false);
+    tabs.addTab("Input Level", backgroundColour, &inputLevelPanel, false);
+    tabs.addTab("Spectrum", backgroundColour, &spectrumDisplay, false);
+    tabs.addTab("Distorsi", backgroundColour, &distortionDisplay, false);
     tabs.addTab("SPL Meter", backgroundColour, &splMeter, false);
     tabs.addTab("Generator", backgroundColour, &generatorPanel, false);
+    tabs.addTab("Rekam", backgroundColour, &recorderPanel, false);
+    tabs.addTab("Offline", backgroundColour, &offlinePanel, false);
+    tabs.addTab("Session & Export", backgroundColour, &sessionPanel, false);
 
     statusLabel.setFont(juce::Font(13.0f));
     statusLabel.setColour(juce::Label::textColourId, mutedColour);
@@ -353,6 +477,67 @@ generatorFrequencySlider.setRange(20.0, 20000.0, 0.1f);
     audioEngine.getGenerator().setFrequency(1000.0f);
     audioEngine.getGenerator().setSweepRange(20.0f, 20000.0f, 10.0f);
 
+    // The measurement worker is prepared before any audio arrives, so its buffers exist
+    // by the time the first captured block is handed over.
+    dspWorker.setSampleRate(audioEngine.getSampleRate());
+    dspWorker.setFftSize(spectrumDisplay.getFftSize());
+    dspWorker.setWindow(spectrumDisplay.getWindowType());
+    dspWorker.setOverlapPercent(spectrumDisplay.getOverlapPercent());
+    dspWorker.setAveraging(spectrumDisplay.getAveragingMode(),
+                           spectrumDisplay.getAveragingSeconds());
+    dspWorker.start();
+
+    audioEngine.onDeviceLost = [this]
+    {
+        // Only ever called from the message thread, from pollDeviceHealth().
+        //
+        // Everything that claims a session is running has to be cleared here, not just the
+        // display. Leaving isRunning true while the device has gone leaves the button
+        // offering to stop a session that no longer exists, so the next press is taken as a
+        // stop: it resets stale state, the button returns to "Mulai", and from the reader's
+        // side Mulai did nothing at all. Only the press after that would start anything.
+        isRunning = false;
+        generatorOn = false;
+        audioEngine.getGenerator().setRunning(false);
+        generatorDisplay.setRunning(false);
+        generatorDisplay.clear();
+
+        fftDisplay.setRunning(false);
+        fftDisplay.setDelayAvailable(false);
+        fftDisplay.pushData({}, {}, {}, {}, {}, {});
+        delayLabel.setText("Delay --", juce::dontSendNotification);
+        reverbDisplay.clear();
+        splMeter.reset();
+
+        startStopButton.setButtonText("Mulai");
+        generatorButton.setButtonText("Nyalakan");
+        updateGeneratorInfo();
+
+        engineStatusMessage = "Perangkat terputus - pilih device lalu tekan Mulai";
+        statusLabel.setText(engineStatusMessage, juce::dontSendNotification);
+    };
+
+    spectrumDisplay.onFftSizeChanged = [this] { spectrumControlsChanged(); };
+    spectrumDisplay.onWindowChanged = [this] { spectrumControlsChanged(); };
+    spectrumDisplay.onAveragingChanged = [this] { spectrumControlsChanged(); };
+
+    // The band analyser shares the FFT size with the spectrum, so both views are built
+    // from one transform and cannot disagree.
+    //
+    // Configured through rtaControlsChanged, which reads the octave selector on the display
+    // rather than the hidden RTA view. That makes the control the user can actually reach the
+    // control that decides the measurement, instead of the two starting out disagreeing and
+    // only agreeing once something is changed.
+    fftDisplay.onOctaveChanged = [this] { rtaControlsChanged(); };
+
+    dspWorker.setRtaAveraging (dsp::SpectrumAnalyser::Averaging::Exponential, 0.5f);
+    dspWorker.setRtaSmoothingSeconds (0.0f);
+    dspWorker.setRtaPeakHoldSeconds (1.0f);
+    dspWorker.setRtaPeakDecayDbPerSecond (20.0f);
+    dspWorker.setRtaMinMaxWindowSeconds (5.0f);
+
+    rtaControlsChanged();
+
     refreshDeviceSelectors();
     updateGeneratorInfo();
     updateStatus();
@@ -365,12 +550,20 @@ MainComponent::~MainComponent()
 {
     generatorPanel.removeComponentListener(this);
     stopTimer();
+    dspWorker.stop();
     audioEngine.getGenerator().setRunning(false);
     audioEngine.stop();
 }
 
 void MainComponent::refreshDeviceSelectors()
 {
+    // Rebuilding the lists empties the combo boxes, so restoring a selection counts as a
+    // change to them and the change callback arrives even though the reader touched
+    // nothing. Left unguarded, that callback reopened the device, the reopen rebuilt the
+    // lists again, and a running session restarted itself forever without the reader ever
+    // touching a control. The flag makes a programmatic rebuild silent.
+    const auto guard = juce::ScopedValueSetter<bool> (rebuildingSelectors, true);
+
     const auto inputs = audioEngine.getInputDeviceLabels();
     const auto outputs = audioEngine.getOutputDeviceLabels();
 
@@ -391,12 +584,18 @@ void MainComponent::refreshDeviceSelectors()
     for (int i = 0; i < outputs.size(); ++i)
         outputSelector.addItem(outputs[i], i + 2);
 
+    // Restoring the previous choice is not a user edit, so it must not notify. Sending a
+    // notification here told the rest of the app that the reader had just changed the sample
+    // rate, which is what made applyAudioSettingsToDevice() reopen the device: this function
+    // also runs inside the start path, so the notification was delivered after the device had
+    // already opened and stopped the session that was starting. A rebuild that fires change
+    // callbacks is a rebuild that renames the user's settings into events.
     inputSelector.setSelectedId(previousInput > 1 && previousInput <= inputs.size() + 1
                                     ? previousInput : juce::jmin(2, inputs.size() + 1),
-                                juce::sendNotification);
+                                juce::dontSendNotification);
     outputSelector.setSelectedId(previousOutput > 1 && previousOutput <= outputs.size() + 1
                                     ? previousOutput : juce::jmin(2, outputs.size() + 1),
-                                juce::sendNotification);
+                                juce::dontSendNotification);
 
     sampleRateSelector.clear();
     bufferSizeSelector.clear();
@@ -465,7 +664,7 @@ void MainComponent::refreshDeviceSelectors()
 
     sampleRateSelector.setSelectedId(previousRate > 0 && previousRate <= rates.size()
                                         ? previousRate : rateId,
-                                    juce::sendNotification);
+                                    juce::dontSendNotification);
 
     int bufferId = 0;
 
@@ -482,7 +681,7 @@ void MainComponent::refreshDeviceSelectors()
 
     bufferSizeSelector.setSelectedId(previousBuffer > 0 && previousBuffer <= buffers.size()
                                         ? previousBuffer : bufferId,
-                                    juce::sendNotification);
+                                    juce::dontSendNotification);
 }
 
 void MainComponent::analysisSettingsChanged()
@@ -504,27 +703,47 @@ void MainComponent::analysisSettingsChanged()
 
 void MainComponent::startStopClicked()
 {
+    // The button is the only toggle in the program, so it is the only place a session is
+    // started or stopped on purpose. Everything else that needs the device reopened calls
+    // restartAudio() instead, because reaching this function to "apply a setting" means the
+    // outcome depends on what the session happened to be doing when the notification
+    // arrived, which is how a running session used to stop itself the instant it opened.
     if (isRunning)
-    {
-        audioEngine.stop();
-        audioEngine.getGenerator().setRunning(false);
-        generatorOn = false;
-        isRunning = false;
+        stopAudio();
+    else
+        startAudio();
+}
 
-        fftDisplay.setDelayAvailable(false);
-        delayLabel.setText("Delay --", juce::dontSendNotification);
-        fftDisplay.setRunning(false);
-        fftDisplay.pushData({}, {}, {}, {}, {}, {});
-        reverbDisplay.clear();
-        splMeter.reset();
+void MainComponent::stopAudio()
+{
+    audioEngine.stop();
+    updateInputGainControl();
+    audioEngine.getGenerator().setRunning(false);
+    generatorOn = false;
+    isRunning = false;
 
-        startStopButton.setButtonText("Mulai");
-        startStopButton.setColour(juce::TextButton::buttonColourId, stoppedColour);
-        generatorButton.setButtonText("Nyalakan");
-        updateGeneratorInfo();
-        updateStatus();
-        return;
-    }
+    fftDisplay.setDelayAvailable(false);
+    delayLabel.setText("Delay --", juce::dontSendNotification);
+    fftDisplay.setRunning(false);
+    fftDisplay.pushData({}, {}, {}, {}, {}, {});
+    reverbDisplay.clear();
+    splMeter.reset();
+
+    startStopButton.setButtonText("Mulai");
+    startStopButton.setColour(juce::TextButton::buttonColourId, runningColour);
+    generatorButton.setButtonText("Nyalakan");
+    updateGeneratorInfo();
+    updateStatus();
+}
+
+void MainComponent::startAudio()
+{
+    // The device lists are rebuilt on every start, so a device plugged in while the window was
+    // open is selectable without a separate refresh control. The previous selection is
+    // restored by refreshDeviceSelectors, so this cannot silently change which device is
+    // being measured.
+    audioEngine.scanDevices();
+    refreshDeviceSelectors();
 
     const auto inputIndex = inputSelector.getSelectedId() - 2;
     const auto outputIndex = outputSelector.getSelectedId() - 2;
@@ -546,6 +765,15 @@ void MainComponent::startStopClicked()
         statusLabel.setText("Pilih microphone pada Input / Rekam", juce::dontSendNotification);
         return;
     }
+
+    // Cleared per attempt rather than on success, so a second start that fails without the
+    // engine reporting anything is still given the generic status line instead of inheriting
+    // the reason the first attempt gave.
+    engineStatusMessage.clear();
+
+    appliedRateId = sampleRateSelector.getSelectedId();
+    appliedBufferSizeId = bufferSizeSelector.getSelectedId();
+
     audioEngine.start(inputName, outputName, rate, bufferSize,
                       audioEngine.getOutputPulseSink(outputIndex));
 
@@ -555,17 +783,48 @@ void MainComponent::startStopClicked()
         fftDisplay.setDelayAvailable(false);
         delayLabel.setText("Delay --", juce::dontSendNotification);
         fftDisplay.setRunning(false);
-        updateStatus();
+
+        // The engine has already written the reason onto the status line. Calling
+        // updateStatus() here would replace it with the generic "pick a device" text on the
+        // very same click, so the reader would be told their device failed to open and then,
+        // immediately, that nothing had happened. The button also stays on "Mulai", which
+        // makes a failed start look exactly like a click that was never registered. So the
+        // reason is left on screen, and the generic text is only used when the engine had
+        // nothing to say.
+        if (engineStatusMessage.isEmpty())
+            updateStatus();
+
         return;
     }
+
+    // The device is open, so anything the engine said about the previous attempt is stale.
+    engineStatusMessage.clear();
+    updateInputGainControl();
 
     referenceFrames = 0;
     isRunning = true;
     startStopButton.setButtonText("Berhenti");
-    startStopButton.setColour(juce::TextButton::buttonColourId, runningColour);
+    startStopButton.setColour(juce::TextButton::buttonColourId, stoppedColour);
 
     splMeter.prepare((float) audioEngine.getSampleRate(), 2048);
     transferFunction.prepare((float) audioEngine.getSampleRate(), fftSize);
+
+    // Sized from the transform the transfer function already uses, so the distortion figures
+    // and the curve on the previous tab describe the same block of audio. A distortion figure
+    // taken from a different length than the curve beside it would be answering a slightly
+    // different question than the reader assumes.
+    distortionAnalyser.prepare(audioEngine.getSampleRate(), transferFunction.getFftSize());
+
+    imdAnalyser.prepare(audioEngine.getSampleRate(), transferFunction.getFftSize());
+    crosstalkAnalyser.prepare(audioEngine.getSampleRate(), transferFunction.getFftSize());
+
+    {
+        dsp::DistortionAnalyser::Settings distortionSettings;
+        distortionSettings.searchLowHz = 20.0f;
+        distortionSettings.searchHighHz = 20000.0f;
+        distortionSettings.maxHarmonic = 10;
+        distortionAnalyser.setSettings(distortionSettings);
+    }
     transferFunction.setAveraging(averagingSelector.getSelectedId());
 
     tabs.setCurrentTabIndex(0);
@@ -575,6 +834,47 @@ void MainComponent::startStopClicked()
     fftDisplay.clearPeakHold();
 
     updateStatus();
+}
+
+void MainComponent::updateInputGainControl()
+{
+    const auto hardware = audioEngine.getHardwareInputGainInfo();
+    hardwareInputGainActive = hardware.available;
+
+    if (hardware.available)
+    {
+        inputGainLabel.setText ("Gain Mic", juce::dontSendNotification);
+        inputGainSlider.setRange (hardware.minimumDb, hardware.maximumDb, 0.5);
+        inputGainSlider.setValue (hardware.currentDb, juce::dontSendNotification);
+        inputGainSlider.setTooltip ("Mengatur gain capture hardware ALSA. Rentang "
+                                    + juce::String (hardware.minimumDb, 1) + " sampai "
+                                    + juce::String (hardware.maximumDb, 1) + " dB.");
+        inputLevelPanel.setInputGainControl (hardware.minimumDb, hardware.maximumDb,
+                                             hardware.currentDb, true);
+        return;
+    }
+
+    inputGainLabel.setText ("Trim Mic", juce::dontSendNotification);
+    inputGainSlider.setRange (-60.0, 24.0, 0.5);
+    inputGainSlider.setValue (softwareInputGainDb, juce::dontSendNotification);
+    inputGainSlider.setTooltip ("Trim digital untuk analisis mikrofon; tidak mengubah gain hardware atau rekaman mentah.");
+    inputLevelPanel.setInputGainControl (-60.0, 24.0, softwareInputGainDb, false);
+}
+
+float MainComponent::analysisInputGainDb() const
+{
+    return hardwareInputGainActive ? 0.0f : softwareInputGainDb;
+}
+
+void MainComponent::restartAudio()
+{
+    // A setting that only takes effect when the device is reopened. Stopping first and
+    // starting second makes the outcome independent of what the session was doing, so this
+    // cannot turn a running session into a stopped one.
+    if (! isRunning)
+        return;
+    stopAudio();
+    startAudio();
 }
 
 void MainComponent::playPinkNoise()
@@ -627,11 +927,15 @@ void MainComponent::generatorToggled()
         }
     }
     generatorOn = !generatorOn;
-    generatorDelayValid = false;
-    generatorDelayCounter = 0;
-    generatorStartedAt = juce::Time::getMillisecondCounterHiRes();
-    generatorDelayFinder.reset();
     transferFunction.reset();
+
+    // The averages have to go as well. They are exponential, so after the generator starts or
+    // stops the display shows the old signal fading into the new one over several time
+    // constants, which reads as the measurement taking a long time to come up when in fact it
+    // is only the average remembering. Resetting is deterministic: it happens on this switch,
+    // not on a level change, so it cannot retrigger while a measurement is under way.
+    dspWorker.resetAveraging();
+
     referenceFrames = 0;
     fftDisplay.setDelayAvailable(false);
     fftDisplay.clearPeakHold();
@@ -683,22 +987,66 @@ void MainComponent::updateGeneratorInfo()
 void MainComponent::updateGeneratorDisplay()
 {
     auto& generator = audioEngine.getGenerator();
-
-    std::vector<float> output;
-    audioEngine.getGeneratorOutput(output);
+    const auto sampleRate = (float) audioEngine.getSampleRate();
 
     generatorDisplay.setSignal(generatorTypeSelector.getText(), (float) generatorLevelSlider.getValue(),
                                generator.getSweepProgress(), generatorOutputLabel());
     generatorDisplay.setGeneratorSettings(generator.getBandLow(), generator.getBandHigh(),
                                           generator.getFrequency(),
                                           generator.getSweepStart(), generator.getSweepEnd());
-    generatorDisplay.setSamples(output, (float) audioEngine.getSampleRate());
+
+    auto sampleCount = generatorDisplay.getRequiredSamples();
+    auto waveformFrequency = 0.0f;
+
+    switch (generator.getType())
+    {
+        case SignalGenerator::Type::Sine:
+        case SignalGenerator::Type::Square:
+        case SignalGenerator::Type::Triangle:
+        case SignalGenerator::Type::Saw:
+            waveformFrequency = generator.getFrequency();
+            break;
+
+        case SignalGenerator::Type::LogSweep:
+            waveformFrequency = generator.getSweepStart()
+                               * std::pow (generator.getSweepEnd() / generator.getSweepStart(),
+                                           generator.getSweepProgress());
+            break;
+
+        default:
+            break;
+    }
+
+    if (waveformFrequency > 0.0f)
+        sampleCount = juce::jmax (sampleCount,
+                                  juce::roundToInt (sampleRate * 3.0f / waveformFrequency));
+
+    audioEngine.getGeneratorOutput (generatorOutputSamples, sampleCount);
+    generatorDisplay.setSamples (generatorOutputSamples, sampleRate);
 }
 
 void MainComponent::updateStatus()
 {
     if (isRunning)
     {
+        auto* device = audioEngine.getDeviceManager().getCurrentAudioDevice();
+        const auto inputChannels = device != nullptr
+                                 ? device->getInputChannelNames().size() : 0;
+
+        // A session can be running and still have nothing to measure. The engine opens the
+        // device it was asked for and reports success, but a device with no capture channels
+        // hands over silence, so every curve stayed flat and the button looked like it had
+        // done nothing. Saying so here is the difference between a dead control and a
+        // readable one, and it names the cause instead of asking the reader to guess.
+        if (inputChannels == 0)
+        {
+            statusLabel.setColour (juce::Label::textColourId, stoppedColour);
+            statusLabel.setText ("Device terbuka tapi tidak punya channel masuk - "
+                                "pilih input lain", juce::dontSendNotification);
+            return;
+        }
+
+        statusLabel.setColour (juce::Label::textColourId, juce::Colours::white);
         statusLabel.setText("Running - " + inputSelector.getText()
                             + " -> " + outputSelector.getText()
                             + " @ " + juce::String((int) audioEngine.getSampleRate()) + " Hz",
@@ -711,20 +1059,42 @@ void MainComponent::updateStatus()
 
 void MainComponent::timerCallback()
 {
+    // Device health and the measurement worker are pumped even while stopped: a device
+    // that disappeared has to be reported, and the worker has to be told to stand down.
+    audioEngine.pollDeviceHealth();
+
     if (!isRunning)
+    {
+        dspWorker.setSpectrumEnabled(false);
+        dspWorker.setRtaEnabled (false);
         return;
+    }
 
-    std::vector<float> ref;
-    std::vector<float> meas;
+    const auto spectrumVisible = spectrumDisplay.isVisible();
+    const auto rtaVisible = rtaDisplay.isVisible();
+    dspWorker.setSpectrumEnabled (spectrumVisible || rtaVisible);
+    dspWorker.setRtaEnabled (rtaVisible);
 
-    std::vector<float> left;
-    std::vector<float> right;
+    // Keep the worker's capture stream independent from the transfer-function FFT below:
+    // a large transfer frame or missing reference must not hold back the Spectrum tab.
+    pumpMeasurementWorker();
 
-    std::vector<float> generated;
-    audioEngine.getLatestBlock(generatorOn ? 65536 : transferFunction.getFftSize(), left, right, &generated);
+    // The generator plot reads the output ring directly. It must update even when the
+    // microphone has not supplied a complete analysis frame or the input is silent, and
+    // hidden generator tabs should not spend time building an FFT nobody can see.
+    if (generatorOn && generatorDisplay.isShowing())
+        updateGeneratorDisplay();
 
-    if (left.size() < (size_t) transferFunction.getFftSize()
-        || right.size() < (size_t) transferFunction.getFftSize())
+    auto& ref = analysisReference;
+    auto& meas = analysisMeasurement;
+    auto& left = analysisLeft;
+    auto& right = analysisRight;
+    auto& generated = analysisGenerated;
+    // A sliding FFT window makes the graph update on every 30 Hz refresh. Reading 65536
+    // samples just because the generator is on made it wait over a second between frames,
+    // although the transfer analysis only uses its selected FFT size and delay search cannot
+    // exceed half that size anyway.
+    if (! audioEngine.readLatestFrame (transferFunction.getFftSize(), left, right, &generated))
         return;
 
     const auto channels = audioEngine.getCapturedChannels();
@@ -746,19 +1116,9 @@ void MainComponent::timerCallback()
     if (generatorOn)
     {
         ref = generated;
-        const bool ready = broadbandGenerator && ref.size() == 65536
-                       && juce::Time::getMillisecondCounterHiRes() - generatorStartedAt
-                          > 1000.0 * 65536.0 / audioEngine.getSampleRate();
-        if (!ready)
-            generatorDelayValid = false;
-        else if (generatorDelayCounter++ % 8 == 0)
-        {
-            const auto lag = generatorDelayFinder.analyse(ref.data(), meas.data(),
-                                                          (float) audioEngine.getSampleRate(), 500.0f);
-            generatorDelayMs = lag * 1000.0f / (float) audioEngine.getSampleRate();
-            generatorDelayValid = generatorDelayMs >= 0.0f && generatorDelayMs < 499.0f
-                              && dsp::delayConfidence(ref, meas, juce::roundToInt(lag)) >= 0.2f;
-        }
+
+        // The reference for the measurement is the generator itself, but it only carries
+        // the delay once the block is longer than the loop can possibly be.
         const auto keep = (size_t) transferFunction.getFftSize();
         if (ref.size() > keep)
         {
@@ -766,34 +1126,6 @@ void MainComponent::timerCallback()
             meas.erase(meas.begin(), meas.end() - (ptrdiff_t) keep);
         }
     }
-
-    double referenceEnergy = 0.0;
-    double measuredEnergy = 0.0;
-
-    for (size_t i = 0; i < ref.size(); ++i)
-    {
-        referenceEnergy += (double) ref[i] * ref[i];
-        measuredEnergy += (double) meas[i] * meas[i];
-    }
-
-    const auto referenceLevel = dsp::db10((float) (referenceEnergy / std::max<size_t>(1, ref.size())));
-    const auto measuredLevel = dsp::db10((float) (measuredEnergy / std::max<size_t>(1, meas.size())));
-
-    // Peak is sampled separately from the running total: RMS squares and averages, so
-    // a single loud transient would be invisible in it.
-    auto measuredPeak = 0.0f;
-    auto referencePeak = 0.0f;
-
-    for (size_t i = 0; i < meas.size(); ++i)
-        measuredPeak = std::max (measuredPeak, std::abs (meas[i]));
-
-    for (size_t i = 0; i < ref.size(); ++i)
-        referencePeak = std::max (referencePeak, std::abs (ref[i]));
-
-    fftDisplay.setMeasuredLevels (measuredLevel, dsp::db20 (measuredPeak));
-    fftDisplay.setReferenceLevels (referenceLevel, dsp::db20 (referencePeak));
-
-    splMeter.process(ref.data(), meas.data(), (int) ref.size());
 
     // The delay search needs the raw pair, so the button sets a flag and the frame that
     // follows does the work with fresh data.
@@ -803,18 +1135,35 @@ void MainComponent::timerCallback()
         transferFunction.findDelay(ref.data(), meas.data());
     }
 
+    applyInputGain (meas, juce::Decibels::decibelsToGain (analysisInputGainDb()));
+
     auto result = transferFunction.process(ref.data(), meas.data(), (int) ref.size());
 
     if (!result.valid)
         return;
 
+    // TransferFunction already measures RMS and peak while it has each sample in hand;
+    // reuse those readings instead of making four more passes over both audio frames.
+    fftDisplay.setMeasuredLevels (result.measRmsDb, result.measPeakDb);
+    fftDisplay.setReferenceLevels (result.refRmsDb, result.refPeakDb);
+
+    const auto referenceLevel = result.refRmsDb;
+    const auto measuredLevel = result.measRmsDb;
+
     const bool hasReference = (generatorOn || channels > 1) && referenceLevel > -80.0f && measuredLevel > -80.0f;
     referenceFrames = hasReference ? referenceFrames + 1 : 0;
-    const bool delayAvailable = generatorOn ? hasReference && generatorDelayValid
-                             : referenceFrames >= 8 && hasReference && averagingSelector.getSelectedId() > 1
+
+    // The delay the phase and the impulse are compensated with is the one the transfer
+    // function tracked on this frame, so the reading and the curves can never disagree. A
+    // reading sitting on the limit of the search means the peak was never found, and a
+    // generator that is not broadband carries no delay to find at all.
+    const auto delayMeasured = transferFunction.isDelayTrusted()
+                            && std::abs (result.delayMs) < transferFunction.getMaxReachableDelayMs() - 1.0f
+                            && (! generatorOn || broadbandGenerator);
+    const bool delayAvailable = generatorOn ? (hasReference && delayMeasured)
+                             : referenceFrames >= 8 && hasReference && delayMeasured
+                               && averagingSelector.getSelectedId() > 1
                                && result.averageCoherence >= 0.5f;
-    if (generatorOn)
-        result.delayMs = generatorDelayMs;
     fftDisplay.setDelayAvailable(delayAvailable);
     if (!hasReference)
     {
@@ -823,10 +1172,15 @@ void MainComponent::timerCallback()
         result.coherence.clear();
         result.impulseResponse.clear();
         reverbDisplay.clear();
+        impedanceDisplay.clear();
     }
-    lastResult = result;
+    // An unavailable delay is carried as NaN, so every reader has to agree on it. Masking
+    // only lastResult left the Transfer Function sidebar showing a number the status line
+    // was hiding.
     if (!delayAvailable)
-        lastResult.delayMs = std::numeric_limits<float>::quiet_NaN();
+        result.delayMs = std::numeric_limits<float>::quiet_NaN();
+
+    lastResult = result;
     fftDisplay.setDelayMs(result.delayMs);
     fftDisplay.setAverageCoherence(result.averageCoherence);
     fftDisplay.pushData(result.freq, result.refMagnitudeDb, result.measMagnitudeDb,
@@ -835,12 +1189,77 @@ void MainComponent::timerCallback()
     if (transferFunctionDisplay.isVisible())
         transferFunctionDisplay.pushData(result);
 
-    delayLabel.setText(delayAvailable ? (generatorOn ? "Total " : "Delay ") + juce::String(result.delayMs, 3) + " ms"
-                                    : (generatorOn ? "Total -- (menunggu mic)" : "Delay -- (perlu referensi)"),
-                       juce::dontSendNotification);
+    // Measured on the measurement channel alone. Distortion belongs to whatever is being
+    // measured, and folding in the reference as well would report the reference's own
+    // distortion and the room's with it.
+    if (distortionDisplay.isVisible())
+    {
+        distortionDisplay.setResult(distortionAnalyser.analyse(meas.data(), (int) meas.size()));
 
-    if (generatorOn && (reverbCounter % 2) == 0)
-        updateGeneratorDisplay();
+        // Intermodulation needs its own two tones, so it is only read when the generator is
+        // actually producing them. Measuring it against whatever happens to be playing would
+        // report the intermodulation of the wrong test, which is worse than reporting nothing.
+        if (generatorOn && imdAnalyser.getSettings().standard == dsp::ImdAnalyser::Standard::Smpte
+             && std::abs (audioEngine.getGenerator().getFrequency() - 1000.0f) < 400.0f)
+        {
+            const auto imd = imdAnalyser.analyse (meas.data(), (int) meas.size());
+
+            statusLabel.setText ("IMD " + dsp::ImdAnalyser::percentToString (imd.imdPercent)
+                                   + "  (" + dsp::ImdAnalyser::levelToString (imd.imdDb) + ")",
+                                 juce::dontSendNotification);
+        }
+
+        // Polarity is judged from the correlation sign rather than the level, because an
+        // inverted channel leaves the level, the spectrum and the coherence completely
+        // unchanged. Only something comparing the waveform against its reference can see it.
+        if (generatorOn)
+        {
+            const auto polarity = polarityDetector.detect (ref.data(), meas.data(),
+                                                           (int) ref.size());
+
+            if (polarity.confident)
+            {
+                const auto verdict = dsp::PolarityDetector::verdictToString (polarity.verdict);
+
+                statusLabel.setColour (juce::Label::textColourId,
+                                      polarity.verdict == dsp::PolarityDetector::Verdict::Inverted
+                                          ? stoppedColour : runningColour);
+                statusLabel.setText ("POLARITAS " + verdict + "  (korelasi "
+                                         + juce::String (polarity.correlation, 3)
+                                         + ", lag " + juce::String (polarity.lagSamples)
+                                         + " sample)",
+                                     juce::dontSendNotification);
+            }
+        }
+    }
+
+    if (impedanceDisplay.isVisible())
+        impedanceDisplay.pushData(result);
+
+    // The distance is shown next to the delay rather than instead of it, because a delay on
+    // its own means nothing to a reader without the air it travelled through, and the
+    // temperature that produced it is printed so the number can be held to account. It stays
+    // blank while the delay is unproven: a confident length derived from a correlation peak
+    // that failed its own confidence check would be the most misleading thing on the bar.
+    juce::String delayText;
+
+    if (delayAvailable)
+    {
+        delayText = (generatorOn ? "Total " : "Delay ") + juce::String (result.delayMs, 3) + " ms";
+
+        if (result.delayDistanceM > 0.0f)
+            delayText += "   " + juce::String (result.delayDistanceM, 2) + " m @ "
+                       + juce::String ((int) result.temperatureC) + "\u00b0C";
+
+        if (! result.delayMethodsAgree && result.phaseSlopeValid)
+            delayText += "  (slope " + juce::String (result.phaseSlopeDelayMs, 2) + " ms)";
+    }
+    else
+    {
+        delayText = generatorOn ? "Total -- (menunggu mic)" : "Delay -- (perlu referensi)";
+    }
+
+    delayLabel.setText (delayText, juce::dontSendNotification);
 
     const auto averages = averagingSelector.getSelectedId();
 
@@ -881,7 +1300,25 @@ void MainComponent::timerCallback()
                                                         (int) result.impulseResponse.size(),
                                                         result.sampleRate);
         reverbDisplay.setAcoustics(acoustics, result.sampleRate);
+
+        // The table's EDT, T20, T30 and RT60 come from here rather than from the legacy figures
+        // above. The legacy fit divides T20 by twenty and doubles T30, so its numbers disagree
+        // with these by a factor of two for the same response; showing both side by side is
+        // how that disagreement would be found, so the table is the one that is labelled.
+        reverbDisplay.setReverbResult(reverbAnalyser.analyse(result.impulseResponse.data(),
+                                                             (int) result.impulseResponse.size(),
+                                                             result.sampleRate));
+
+        const std::vector<float> bandCentres { 31.5f, 63.0f, 125.0f, 250.0f, 500.0f,
+                                               1000.0f, 2000.0f, 4000.0f, 8000.0f, 16000.0f };
+        reverbDisplay.setBandRt60(ImpulseResponse::bandRt60(result.impulseResponse.data(),
+                                                            (int) result.impulseResponse.size(),
+                                                            result.sampleRate, bandCentres));
+        reverbDisplay.setWaterfall(ImpulseResponse::waterfall(result.impulseResponse.data(),
+                                                              (int) result.impulseResponse.size(),
+                                                              result.sampleRate, bandCentres));
     }
+
 }
 
 void MainComponent::updateCalibrationLabel()
@@ -893,11 +1330,22 @@ void MainComponent::updateCalibrationLabel()
 
 void MainComponent::applyCalibrationToSplMeter()
 {
-    // The SPL meter already adds its own calibration offset to a 0 dBFS reference,
-    // so only the sensitivity step is handed over here.
-    const auto offset = microphoneCalibration.isEnabled() ? microphoneCalibration.getSensitivityDb()
-                                                           : 120.0f;
-    splMeter.setCalibrationOffset (offset);
+    // The whole profile is handed over rather than a single offset, because the meter has to
+    // know whether the profile was ever measured against a reference. Passing the number alone
+    // would let it report a confident SPL from a profile that was merely selected.
+    splMeter.setCalibration (microphoneCalibration);
+
+    // The status line says which of the two states the readings are in. A reader looking at a
+    // level in decibels has to be able to see whether anything is known about the microphone
+    // behind it, and "94 dB" in a box does not say so.
+    const auto description = microphoneCalibration.describe();
+
+    if (microphoneCalibration.hasCalibration())
+        statusLabel.setColour (juce::Label::textColourId, runningColour);
+    else
+        statusLabel.setColour (juce::Label::textColourId, stoppedColour);
+
+    statusLabel.setText (description, juce::dontSendNotification);
 }
 
 void MainComponent::calibrationMenuClicked()
@@ -907,6 +1355,12 @@ void MainComponent::calibrationMenuClicked()
     menu.addItem (2, "Dayton Audio iMM-6c",
                   microphoneCalibration.getModelName() == "Dayton Audio iMM-6c");
     menu.addSeparator();
+    // The workflow an acoustic calibrator exists for: put the microphone in the calibrator,
+    // set the box to the level it is marked with, and the correction is whatever this chain
+    // read against it. Nothing here asks for a sensitivity figure, because the measurement is
+    // the authority and a typed number would not be.
+    menu.addItem (5, "Kalibrasi dengan acoustic calibrator...");
+    menu.addItem (6, "Simpan profil kalibrasi ke file...");
     menu.addItem (3, "Muat kurva kalibrasi (TXT/CSV)...");
     menu.addItem (4, "Reset kalibrasi", microphoneCalibration.getModelName() == "Tanpa kalibrasi");
 
@@ -928,6 +1382,14 @@ void MainComponent::calibrationMenuClicked()
                                                      "Pilih rentang display yang sesuai bila grafik terpotong",
                                                      juce::dontSendNotification);
                             }
+            else if (result == 5)
+            {
+                runCalibratorWorkflow();
+            }
+            else if (result == 6)
+            {
+                saveCalibrationProfile();
+            }
                             else if (result == 3)
                             {
                                 // Dayton's download tool saves the file as .txt, so both are offered.
@@ -1265,6 +1727,169 @@ void MainComponent::exportCSVClicked()
                          });
 }
 
+void MainComponent::exportIrClicked()
+{
+    if (lastResult.impulseResponse.empty())
+    {
+        statusLabel.setText("Belum ada impuls response untuk diekspor", juce::dontSendNotification);
+        return;
+    }
+
+    auto* chooser = new juce::FileChooser("Export IR WAV",
+                                          juce::File::getCurrentWorkingDirectory(),
+                                          "*.wav");
+
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode
+                             | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
+                         [this, chooser] (const juce::FileChooser& fc)
+                         {
+                             const juce::File file = fc.getResult();
+                             delete chooser;
+
+                             if (file == juce::File())
+                                 return;
+
+                             juce::WavAudioFormat wav;
+                             std::unique_ptr<juce::AudioFormatWriter> writer(
+                                 wav.createWriterFor(new juce::FileOutputStream(file),
+                                                     lastResult.sampleRate, 1, 32, {}, 0));
+
+                             if (writer != nullptr)
+                             {
+                                 auto* data = lastResult.impulseResponse.data();
+                                 writer->writeFromAudioSampleBuffer(
+                                     juce::AudioSampleBuffer(&data, 1, (int) lastResult.impulseResponse.size()), 0,
+                                     (int) lastResult.impulseResponse.size());
+                                 statusLabel.setText("IR disimpan: " + file.getFileName(),
+                                                     juce::dontSendNotification);
+                             }
+                         });
+}
+
+void MainComponent::spectrumControlsChanged()
+{
+    dspWorker.setFftSize(spectrumDisplay.getFftSize());
+    dspWorker.setWindow(spectrumDisplay.getWindowType());
+    dspWorker.setOverlapPercent(spectrumDisplay.getOverlapPercent());
+    dspWorker.setAveraging(spectrumDisplay.getAveragingMode(),
+                           spectrumDisplay.getAveragingSeconds());
+}
+
+void MainComponent::rtaControlsChanged()
+{
+    dspWorker.setRtaResolution (rtaDisplay.getResolution());
+    dspWorker.setRtaRange (rtaDisplay.getRangeLow(), rtaDisplay.getRangeHigh());
+
+    // The octave selector on the display is what the user can reach now that the separate RTA
+    // tab is gone, so it is what the analysis is configured from. Reading it here rather than
+    // only on the change event means the two can never start out disagreeing.
+    fftDisplay.onOctaveChanged = [this] { rtaControlsChanged(); };
+}
+
+void MainComponent::applyAudioSettingsToDevice()
+{
+    // A rebuild in progress is this class changing the controls to match the device, not the
+    // reader changing a setting, so it must not reopen anything.
+    if (rebuildingSelectors)
+        return;
+
+    // Nothing to reopen while the engine is not running: the values are read again by
+    // the next start, so changing them here would only be noise on screen.
+    if (! isRunning)
+        return;
+
+    // Reopening the device interrupts the stream, so it is only worth doing when a value
+    // really moved. Without this, a notification carrying the value that is already applied
+    // still drops the session for nothing.
+    const auto rate = sampleRateSelector.getSelectedId();
+    const auto bufferSize = bufferSizeSelector.getSelectedId();
+
+    if (rate == appliedRateId && bufferSize == appliedBufferSizeId)
+        return;
+
+    appliedRateId = rate;
+    appliedBufferSizeId = bufferSize;
+
+    restartAudio();
+}
+
+void MainComponent::pumpMeasurementWorker()
+{
+    const auto needsWorkerSnapshot = inputLevelPanel.isVisible()
+                                  || spectrumDisplay.isVisible()
+                                  || rtaDisplay.isVisible();
+
+    if (audioEngine.isRunning())
+    {
+        // Only the samples this reader has not seen, so the analyser frames a continuous
+        // stream instead of the same window over and over.
+        audioEngine.readNewSamples(workerLeft, workerRight, &workerGenerated);
+
+        if (! workerLeft.empty())
+        {
+            dsp::assignMeasurementAndReference (measurementChannelIndex(), workerLeft,
+                                                workerRight, analysisMeasurement,
+                                                analysisReference);
+
+            // Match the Transfer Function's routing: the played generator is the reference
+            // when it is active, otherwise use the selected second input channel.
+            if (generatorOn && workerGenerated.size() == analysisMeasurement.size())
+                analysisReference = workerGenerated;
+
+            const auto inputGainDb = analysisInputGainDb();
+            if (analysisReference.size() == analysisMeasurement.size())
+                splMeter.process (analysisReference.data(), analysisMeasurement.data(),
+                                  (int) analysisMeasurement.size(), inputGainDb);
+
+            applyInputGain (analysisMeasurement,
+                            juce::Decibels::decibelsToGain (inputGainDb));
+        }
+
+        if (needsWorkerSnapshot && !workerLeft.empty())
+            dspWorker.pushSamples(workerLeft.data(),
+                                  workerRight.empty() ? nullptr : workerRight.data(),
+                                  analysisMeasurement.data(),
+                                  analysisReference.data(),
+                                  workerGenerated.empty() ? nullptr : workerGenerated.data(),
+                                  (int) analysisMeasurement.size());
+    }
+
+    if (! needsWorkerSnapshot)
+        return;
+
+    DspWorker::Snapshot snapshot;
+
+    if (!dspWorker.getSnapshot(snapshot))
+        return;
+
+    if (inputLevelPanel.isVisible())
+        inputLevelPanel.setSnapshot(snapshot);
+
+    if (spectrumDisplay.isVisible() && snapshot.spectrumValid
+         && !snapshot.spectrumDb.empty())
+    {
+        spectrumDisplay.setSpectrum(snapshot.spectrumFrequency, snapshot.spectrumDb,
+                                    "FFT " + juce::String(snapshot.spectrumFftSize)
+                                        + " | " + juce::String((int)snapshot.sampleRate) + " Hz");
+    }
+
+    if (rtaDisplay.isVisible() && snapshot.rtaValid && !snapshot.rtaBands.empty())
+    {
+        // The unresolved count is on screen because a band narrower than one FFT bin has
+        // no level worth reading, and hiding that would make a wrong FFT size look fine.
+        juce::String status = juce::String (snapshot.rtaResolution) + " oktaf, "
+                            + juce::String (snapshot.rtaBands.size()) + " band, FFT "
+                            + juce::String (snapshot.spectrumFftSize);
+
+        if (snapshot.rtaUnresolvedBands > 0)
+            status += " | " + juce::String (snapshot.rtaUnresolvedBands)
+                      + " band lebih sempit dari 1 bin (merah)";
+
+        rtaDisplay.setBands(snapshot.rtaBands, snapshot.rtaFrequencies, status);
+    }
+}
+
 juce::Rectangle<int> MainComponent::topBarBounds() const
 {
     return getLocalBounds().withTrimmedTop(8).withHeight(154).reduced(12, 0);
@@ -1309,6 +1934,13 @@ void MainComponent::resized()
     inputSelector.setBounds(inputArea.reduced(0, 3));
     outputLabel.setBounds(devices.removeFromLeft(110));
     outputSelector.setBounds(devices.reduced(0, 3));
+    // Start sits at the far right, next to Kalibrasi Mic: it is the one control that has to
+    // be found and pressed first, and the far right corner is where the eye ends up after
+    // reading the input and output pickers it depends on.
+    auto startStopArea = controls.removeFromRight (160).reduced (0, 3);
+    startStopButton.setBounds (startStopArea.withSizeKeepingCentre (startStopArea.getWidth(),
+                                                                    startStopArea.getHeight()));
+    controls.removeFromLeft (8);
     calibrationButton.setBounds (controls.removeFromRight (130).reduced (0, 3));
     controls.removeFromLeft (6);
     saveSnapshotButton.setBounds (controls.removeFromRight (110).reduced (0, 3));
@@ -1316,12 +1948,20 @@ void MainComponent::resized()
     loadSnapshotButton.setBounds (controls.removeFromRight (100).reduced (0, 3));
     controls.removeFromLeft (6);
     auto generatorRow = controls.removeFromBottom(34);
-    pinkNoiseButton.setBounds(generatorRow.removeFromLeft(180));
-    generatorRow.removeFromLeft(12);
-    pinkNoiseLevel.setBounds(generatorRow.removeFromLeft(250));
-    generatorRow.removeFromLeft(12);
+    const auto compactGeneratorRow = generatorRow.getWidth() < 1100;
+    pinkNoiseButton.setBounds (generatorRow.removeFromLeft (compactGeneratorRow ? 160 : 180));
+    generatorRow.removeFromLeft (compactGeneratorRow ? 10 : 12);
+    pinkNoiseLevel.setBounds (generatorRow.removeFromLeft (compactGeneratorRow ? 200 : 250));
+    generatorRow.removeFromLeft (8);
+    inputGainLabel.setBounds (generatorRow.removeFromLeft (compactGeneratorRow ? 72 : 76));
+    inputGainSlider.setBounds (generatorRow.removeFromLeft (compactGeneratorRow ? 190 : 210));
+    generatorRow.removeFromLeft (compactGeneratorRow ? 8 : 12);
+    // Taken from the right of the hint rather than from the crowded settings row above, which
+    // is already within a few pixels of the window width.
+    temperatureSelector.setBounds (generatorRow.removeFromRight (compactGeneratorRow ? 120 : 132));
+    generatorRow.removeFromRight (compactGeneratorRow ? 8 : 10);
     pinkNoiseHint.setBounds(generatorRow);
-    controls = controls.removeFromTop(36);
+    controls = controls.removeFromTop(40);
     measurementChannelSelector.setBounds(controls.removeFromLeft(140));
     controls.removeFromLeft(8);
     referenceChannelSelector.setBounds(controls.removeFromLeft(140));
@@ -1329,16 +1969,16 @@ void MainComponent::resized()
     sampleRateSelector.setBounds(controls.removeFromLeft(100));
     controls.removeFromLeft(8);
     bufferSizeSelector.setBounds(controls.removeFromLeft(100));
-    controls.removeFromLeft(8);
-    refreshButton.setBounds(controls.removeFromLeft(90));
     controls.removeFromLeft(12);
     fftSizeSelector.setBounds(controls.removeFromLeft(120));
     controls.removeFromLeft(8);
     averagingSelector.setBounds(controls.removeFromLeft(90));
     controls.removeFromLeft(12);
-    startStopButton.setBounds(controls.removeFromLeft(110));
-    controls.removeFromLeft(8);
     exportButton.setBounds(controls.removeFromLeft(110));
+    controls.removeFromLeft(8);
+    exportIrButton.setBounds(controls.removeFromLeft(90));
+    controls.removeFromLeft(12);
+    startHintLabel.setBounds(controls.removeFromLeft(430));
 
     tabs.setBounds(area.reduced(12, 0).withTrimmedTop(166).withTrimmedBottom(34));
 
@@ -1669,7 +2309,11 @@ void MainComponent::layoutGenerator()
     area.removeFromLeft(20);
     generatorDisplay.setBounds(area);
 
-    generatorButton.setBounds(panel.removeFromTop(44).removeFromLeft(160));
+    {
+        auto generatorRow = panel.removeFromTop (44);
+        generatorButton.setBounds (generatorRow.removeFromLeft (160));
+        generatorMuteButton.setBounds (generatorRow.removeFromLeft (110).reduced (0, 6));
+    }
 
     generatorInfoLabel.setBounds(panel.removeFromTop(40).reduced(0, 8));
     panel.removeFromTop(10);
@@ -1717,4 +2361,116 @@ void MainComponent::layoutGenerator()
 
     generatorSweepDurationLabel.setBounds(sweepColumn.removeFromTop(24));
     generatorSweepDurationSlider.setBounds(sweepColumn.removeFromTop(36).reduced(0, 4));
+}
+
+float MainComponent::measuredMicLevelDbfs() const
+{
+    return splMeter.getMeasuredMicLevelDbfs();
+}
+
+void MainComponent::runCalibratorWorkflow()
+{
+    if (! isRunning)
+    {
+        statusLabel.setText ("Kalibrasi: mulai capture, pasang acoustic calibrator pada mikrofon, "
+                             "lalu tekan Kalibrasi Mic di tab SPL Meter",
+                             juce::dontSendNotification);
+        return;
+    }
+
+    const auto reading = measuredMicLevelDbfs();
+
+    if (! std::isfinite (reading) || reading < -80.0f)
+    {
+        // Better to say nothing was heard than to calibrate against a floor. A calibrator that
+        // is off, muted, or on the wrong input would produce a profile that is confidently
+        // wrong, and nothing on screen would look wrong.
+        statusLabel.setText ("Tidak ada sinyal mic: nyalakan acoustic calibrator dan pastikan "
+                             "level terbaca sebelum kalibrasi",
+                             juce::dontSendNotification);
+        return;
+    }
+
+    // Ask for the level printed on the acoustic calibrator; 94 and 114 dB are both common,
+    // and assuming one would scale every subsequent SPL reading incorrectly.
+    auto* prompt = new juce::AlertWindow (
+        "Kalibrasi mikrofon",
+        "Cara kalibrasi:\n"
+          + juce::String ("1. Pasang acoustic calibrator terkalibrasi rapat pada kapsul mikrofon.\n")
+          + "2. Nyalakan calibrator dan tunggu level stabil.\n"
+          + "3. Masukkan level dB SPL yang tercetak pada calibrator (mis. 94 atau 114).\n\n"
+          + "Level mic yang terbaca sekarang: " + juce::String (reading, 1) + " dBFS.",
+        juce::MessageBoxIconType::InfoIcon);
+
+    prompt->addTextEditor ("level", "94", "dB SPL");
+    prompt->addButton ("Simpan", 1);
+    prompt->addButton ("Batal", 0);
+
+    // Captured by value deliberately: the lambda outlives this scope, and the window has to
+    // survive until the user answers it. It deletes itself once answered.
+    auto* window = prompt;
+
+    prompt->enterModalState (true,
+                             juce::ModalCallbackFunction::create (
+                                 [this, window, reading] (int result)
+                                 {
+                                     if (result == 1)
+                                     {
+                                         const auto reference =
+                                             window->getTextEditorContents ("level").getFloatValue();
+
+                                         if (! (reference >= 40.0f && reference <= 160.0f))
+                                         {
+                                             statusLabel.setText ("Level calibrator di luar "
+                                                                  "rentang yang masuk akal "
+                                                                  "(40-160 dB SPL)",
+                                                                  juce::dontSendNotification);
+                                         }
+                                         else
+                                         {
+                                             microphoneCalibration.calibrateAgainst (
+                                                 reference, reading,
+                                                 microphoneCalibration.getModelName());
+                                             applyCalibrationToSplMeter();
+
+                                             statusLabel.setText (
+                                                 "Kalibrasi selesai: " + juce::String (reference, 0)
+                                                   + " dB SPL dibaca sebagai "
+                                                   + juce::String (reading, 1) + " dBFS",
+                                                 juce::dontSendNotification);
+                                         }
+                                     }
+
+                                     delete window;
+                                 }));
+}
+
+void MainComponent::saveCalibrationProfile()
+{
+    if (! microphoneCalibration.hasCalibration())
+    {
+        statusLabel.setText ("Belum ada kalibrasi untuk disimpan", juce::dontSendNotification);
+        return;
+    }
+
+    auto* chooser = new juce::FileChooser ("Simpan profil kalibrasi mikrofon",
+                                           juce::File::getSpecialLocation (
+                                               juce::File::userDocumentsDirectory),
+                                           "*.json");
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode
+                            | juce::FileBrowserComponent::canSelectFiles,
+                          [this, chooser] (const juce::FileChooser& fc)
+                          {
+                              const auto file = fc.getResult();
+                              delete chooser;
+
+                              if (file == juce::File())
+                                  return;
+
+                              statusLabel.setText (
+                                  microphoneCalibration.saveToFile (file)
+                                      ? "Profil kalibrasi disimpan: " + file.getFileName()
+                                      : "Gagal menyimpan profil kalibrasi",
+                                  juce::dontSendNotification);
+                          });
 }

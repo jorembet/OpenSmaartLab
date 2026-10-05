@@ -8,10 +8,12 @@ from audio_engine import AudioEngine
 from device_labels import device_label
 from dsp import (
     fft_spectrum, fractional_octave_smooth, TransferEstimator,
-    find_delay, acoustics_from_ir, weighted_rms_dbfs, db20
+    find_delay, apply_delay, acoustics_from_ir, weighted_rms_dbfs, db20
 )
 
 APP_NAME = "OpenSmaartLab"
+DELAY_CHECK_INTERVAL = 0.75
+DELAY_HYSTERESIS_SAMPLES = 4
 
 pg.setConfigOption("background", "#111318")
 pg.setConfigOption("foreground", "#d7dde8")
@@ -31,7 +33,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.leq_samples = 0
         self.last_data = {}
         self.delay_samples = 0
-        self.last_generator_delay_check = 0.0
+        self.last_delay_check = 0.0
         self.spec_history = None
         self.spl_fast = 0.0
         self.spl_slow = 0.0
@@ -55,6 +57,10 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         QComboBox:hover,QPushButton:hover { border-color:#5a6270; }
         QPushButton:checked { background:#8f263a; border-color:#a03040; }
+        QCheckBox { spacing:6px; font-size:13px; padding:2px 4px; }
+        QCheckBox::indicator { width:15px; height:15px; border:1px solid #3b4150;
+            border-radius:4px; background:#222631; }
+        QCheckBox::indicator:checked { background:#4fc3f7; border-color:#4fc3f7; }
         QTabWidget::pane { border:0; }
         QTabBar::tab { padding:10px 20px; background:#1a1e26; font-size:13px; }
         QTabBar::tab:selected { background:#2d3440; }
@@ -83,8 +89,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.setToolTip("Mulai/Hentikan input audio (Spasi)")
 
         self.delay_btn = QtWidgets.QPushButton("Cari Delay")
-        self.delay_btn.clicked.connect(self.do_find_delay)
-        self.delay_btn.setToolTip("Cari delay antar channel (D)")
+        self.delay_btn.clicked.connect(self.request_delay)
+        self.delay_btn.setToolTip("Cari delay antar channel sekarang (D)")
+
+        self.auto_delay_cb = QtWidgets.QCheckBox("Auto")
+        self.auto_delay_cb.setChecked(True)
+        self.auto_delay_cb.setToolTip(
+            "Cari delay otomatis untuk generator internal maupun referensi 2 kanal")
+        self.auto_delay_cb.toggled.connect(self.on_auto_delay_toggled)
 
         self.capture_btn = QtWidgets.QPushButton("Simpan CSV")
         self.capture_btn.clicked.connect(self.capture_csv)
@@ -97,6 +109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addSeparator()
         tb.addWidget(self.start_btn)
         tb.addWidget(self.delay_btn)
+        tb.addWidget(self.auto_delay_cb)
         tb.addWidget(self.capture_btn)
 
         self.tabs = QtWidgets.QTabWidget()
@@ -352,7 +365,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def setup_shortcuts(self):
         QtGui.QShortcut(QtGui.QKeySequence("Space"), self, self.start_btn.click)
-        QtGui.QShortcut(QtGui.QKeySequence("D"), self, self.delay_btn.click)
+        QtGui.QShortcut(QtGui.QKeySequence("D"), self, self.request_delay)
         QtGui.QShortcut(QtGui.QKeySequence("C"), self, self.capture_btn.click)
         QtGui.QShortcut(QtGui.QKeySequence("R"), self, self.reset_leq)
         QtGui.QShortcut(QtGui.QKeySequence("G"), self, self.gen_btn.click)
@@ -510,11 +523,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if frac:
                 output_spec = fractional_octave_smooth(f, output_spec, frac)
             self.generator_curve.setData(f[mask], output_spec[mask])
-            if time.monotonic() - self.last_generator_delay_check >= 0.75:
-                self.do_find_delay()
-                self.last_generator_delay_check = time.monotonic()
         else:
             self.generator_curve.setData([], [])
+
+        self.auto_delay_check()
 
         bars = self.rta_style.currentIndex() == 0
         self.mic_bars.setVisible(bars)
@@ -548,7 +560,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if has_reference:
             favg = {"Fast": .55, "Medium": .82, "Slow": .94}[self.avg_combo.currentText()]
             self.tf.alpha = favg
-            f2, mag, phase, coh, H, ir = self.tf.process(ref, meas, fs, nfft)
+            ref_tf = apply_delay(ref, self.delay_samples) if self.delay_samples else ref
+            f2, mag, phase, coh, H, ir = self.tf.process(ref_tf, meas, fs, nfft)
             if frac:
                 mag = fractional_octave_smooth(f2, mag, frac)
                 phase = fractional_octave_smooth(f2, phase, frac)
@@ -619,41 +632,74 @@ class MainWindow(QtWidgets.QMainWindow):
     def reset_routing(self, *_):
         self.tf = TransferEstimator(alpha=.84)
         self.delay_samples = 0
-        self.last_generator_delay_check = 0.0
+        self.last_delay_check = 0.0
         self.delay_label.setText("Delay: -- ms")
         self.spec_history = None
         self.peak_hold = None
         self.rta_peak_curve.setData([], [])
         self.last_data = {}
 
-    def do_find_delay(self):
+    def request_delay(self):
+        self.do_find_delay()
+
+    def on_auto_delay_toggled(self, on):
+        self.last_delay_check = 0.0
+        if on:
+            self.auto_delay_check()
+
+    def auto_delay_check(self):
+        if not self.auto_delay_cb.isChecked():
+            return
+        now = time.monotonic()
+        if now - self.last_delay_check < DELAY_CHECK_INTERVAL:
+            return
+        self.last_delay_check = now
+        self.do_find_delay(quiet=True)
+
+    def delay_feedback(self, text, message=None, quiet=False):
+        if quiet:
+            return
+        self.delay_label.setText(text)
+        if message:
+            self.status.showMessage(message)
+
+    def do_find_delay(self, quiet=False):
         internal = self.engine.gen_on and self.engine.duplex
         n = 65536 if internal else 16384
         data, generated = self.engine.get_latest_pair(n)
         if len(data) < n or (not internal and data.shape[1] < 2):
-            self.delay_label.setText("Delay: -- (menunggu sinyal / referensi)")
+            self.delay_feedback("Delay: -- (menunggu sinyal / referensi)", quiet=quiet)
             return
         if internal and self.engine.gen_type not in ("Pink", "Pink Noise", "White", "White Noise"):
-            self.delay_label.setText("Delay: -- (gunakan pink noise)")
+            self.delay_feedback("Delay: -- (gunakan pink noise)", quiet=quiet)
             return
         mic_index = self.mic_channel.currentIndex() if data.shape[1] > 1 else 0
         ref = generated if internal else data[:, 1 - mic_index]
         meas = data[:, mic_index]
         if np.mean(ref ** 2) <= 1e-8 or np.mean(meas ** 2) <= 1e-8:
-            self.delay_label.setText("Delay: -- (sinyal terlalu kecil)")
-            self.status.showMessage("Hubungkan referensi dan microphone; keduanya harus menerima sinyal")
+            self.delay_feedback(
+                "Delay: -- (sinyal terlalu kecil)",
+                "Hubungkan referensi dan microphone; keduanya harus menerima sinyal", quiet=quiet)
             return
         ms, samples = find_delay(ref, meas, self.engine.fs)
         aligned_ref = ref[:len(ref)-samples] if samples >= 0 else ref[-samples:]
         aligned_meas = meas[samples:] if samples >= 0 else meas[:len(meas)+samples]
         confidence = abs(np.corrcoef(aligned_ref, aligned_meas)[0, 1])
         if not np.isfinite(confidence) or confidence < (0.2 if internal else 0.5) or (internal and not 0 <= ms < 499):
-            self.delay_label.setText("Delay: -- (referensi tidak cocok)")
-            self.status.showMessage("Gunakan sinyal broadband yang sama pada referensi dan microphone")
+            self.delay_feedback(
+                "Delay: -- (referensi tidak cocok)",
+                "Gunakan sinyal broadband yang sama pada referensi dan microphone", quiet=quiet)
             return
-        self.delay_samples = samples
-        self.delay_label.setText(f"{'Delay total' if internal else 'Delay'}: {ms:.3f} ms")
-        self.status.showMessage(f"Delay terukur: {ms:.3f} ms ({samples} samples)")
+        if abs(samples - self.delay_samples) > DELAY_HYSTERESIS_SAMPLES:
+            self.delay_samples = samples
+            self.tf.reset()
+        else:
+            samples = self.delay_samples
+            ms = samples/self.engine.fs*1000.0
+        text = f"{'Delay total' if internal else 'Delay'}: {ms:.3f} ms"
+        self.delay_label.setText(f"{text} (auto)" if quiet else text)
+        if not quiet:
+            self.status.showMessage(f"Delay terukur: {ms:.3f} ms ({samples} samples)")
 
     def reset_leq(self):
         self.leq_energy = 0

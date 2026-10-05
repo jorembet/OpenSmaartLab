@@ -312,6 +312,142 @@ float MicrophoneCalibration::correctionDb(float frequency) const
     return previous->db + fraction * (next->db - previous->db);
 }
 
+void MicrophoneCalibration::calibrateAgainst (float referenceSplDb, float measuredDbfs,
+                                              const juce::String& microphoneName)
+{
+    if (! std::isfinite (referenceSplDb) || ! std::isfinite (measuredDbfs))
+        return;
+
+    calibratorLevelDb = juce::jlimit (60.0f, 160.0f, referenceSplDb);
+    calibratorReadingDb = measuredDbfs;
+
+    // The whole correction, expressed the same way toSpl adds it: the difference between what
+    // the calibrator was set to and what the chain actually read. Folding it into the
+    // sensitivity rather than adding a second term keeps one number doing one job, and means
+    // every path that converts to SPL picks the correction up without having to know how it
+    // was arrived at.
+    sensitivityDb = calibratorLevelDb - calibratorReadingDb - 3.0103f;
+    measuredSensitivity = true;
+    calibratedAgainstReference = true;
+    enabled = true;
+
+    // Stamped only when a name was supplied, so re-running the calibration on the same mic does
+    // not wipe the model off it.
+    if (microphoneName.isNotEmpty())
+        modelName = microphoneName;
+
+    // Stamped in ISO form with no time of day, because a calibration is a day's work and the
+    // hour it was finished says nothing about whether it is still good. A fixed format also
+    // means the date sorts correctly when profiles are listed.
+    calibrationDate = juce::Time::getCurrentTime().toString (false, true, false, false);
+}
+
+juce::String MicrophoneCalibration::toJson() const
+{
+    juce::String text;
+    text << "{\n";
+    text << "  \"tool\": \"OpenSmaartLab\",\n";
+    text << "  \"model\": \"" << modelName.replace ("\"", "'") << "\",\n";
+    text << "  \"enabled\": " << (enabled ? "true" : "false") << ",\n";
+    text << "  \"calibratedAgainstReference\": " << (calibratedAgainstReference ? "true" : "false") << ",\n";
+    text << "  \"sensitivityDb\": " << juce::String (sensitivityDb, 4) << ",\n";
+    text << "  \"inputTrimDb\": " << juce::String (inputTrimDb, 4) << ",\n";
+    text << "  \"calibratorLevelDb\": " << juce::String (calibratorLevelDb, 2) << ",\n";
+    text << "  \"calibratorReadingDb\": " << juce::String (calibratorReadingDb, 4) << ",\n";
+    text << "  \"calibrationDate\": \"" << calibrationDate.replace ("\"", "'") << "\",\n";
+    text << "  \"curve\": [\n";
+
+    for (size_t i = 0; i < curve.size(); ++i)
+    {
+        text << "    { \"frequency\": " << juce::String (curve[i].frequency, 4)
+             << ", \"db\": " << juce::String (curve[i].db, 4) << " }";
+
+        if (i + 1 < curve.size())
+            text << ",";
+
+        text << "\n";
+    }
+
+    text << "  ]\n}\n";
+    return text;
+}
+
+bool MicrophoneCalibration::fromJson (const juce::String& text)
+{
+    if (text.isEmpty())
+        return false;
+
+    const auto json = juce::JSON::parse (text);
+
+    if (! json.isObject())
+        return false;
+
+    MicrophoneCalibration loaded;
+    loaded.modelName = json["model"].toString();
+    loaded.enabled = (bool) json["enabled"];
+    loaded.calibratedAgainstReference = (bool) json["calibratedAgainstReference"];
+    loaded.sensitivityDb = (float) json["sensitivityDb"];
+    loaded.inputTrimDb = (float) json["inputTrimDb"];
+    loaded.calibratorLevelDb = (float) (json["calibratorLevelDb"] == juce::var()
+                                            ? 94.0 : (double) json["calibratorLevelDb"]);
+    loaded.calibratorReadingDb = (float) json["calibratorReadingDb"];
+    loaded.calibrationDate = json["calibrationDate"].toString();
+
+    std::vector<CurvePoint> loadedCurve;
+    const auto curve = json["curve"];
+
+    if (curve.isArray())
+    {
+        for (int i = 0; i < curve.size(); ++i)
+        {
+            const auto point = curve[i];
+            loadedCurve.push_back ({ (float) point["frequency"], (float) point["db"] });
+        }
+    }
+
+    // Only a profile that names itself and carries a sensitivity is accepted. A file that
+    // merely parses is not the same as a file that describes a microphone, and accepting the
+    // first would let any stray settings file leave the meter reporting dB SPL from nothing.
+    if (loaded.modelName.trim().isEmpty())
+        return false;
+
+    if (! std::isfinite ((double) loaded.sensitivityDb))
+        return false;
+
+    *this = loaded;
+    measuredSensitivity = true;
+    setCurve (std::move (loadedCurve));
+    return true;
+}
+
+bool MicrophoneCalibration::saveToFile (const juce::File& file) const
+{
+    if (file == juce::File())
+        return false;
+
+    return file.replaceWithText (toJson());
+}
+
+juce::String MicrophoneCalibration::describe() const
+{
+    if (! hasCalibration())
+        return "MIC NOT CALIBRATED";
+
+    juce::String text = "MIC CALIBRATED";
+
+    if (modelName.trim().isNotEmpty() && modelName != "Tanpa kalibrasi")
+        text += " - " + modelName;
+
+    text += "  (" + juce::String ((int) calibratorLevelDb) + " dB ref, "
+            + juce::String (sensitivityDb, 1) + " dB sens";
+
+    if (calibrationDate.isNotEmpty())
+        text += ", " + calibrationDate;
+
+    text += ")";
+    return text;
+}
+
 float MicrophoneCalibration::toSpl(float dbfs) const
 {
     if (! enabled)

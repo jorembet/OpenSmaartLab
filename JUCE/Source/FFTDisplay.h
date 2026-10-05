@@ -12,7 +12,7 @@
 class FFTDisplay : public juce::Component
 {
 public:
-    enum class Mode { SingleChannel = 1, DualChannel, TransferFunction, Coherence, Phase };
+    enum class Mode { SingleChannel = 1, DualChannel };
     enum class Style { Bands = 1, BarLinear, Line, Spectrogram };
 
     struct TraceInfo
@@ -45,11 +45,20 @@ public:
     /** Display range in dB. Shared by the axes and the spectrogram colour scale, so the
         two cannot drift apart. */
     void setRange(float top, float bottom);
+    void setRangeEditorsVisible(bool shouldShow);
     float getRangeTop() const { return topDb; }
     float getRangeBottom() const { return bottomDb; }
 
     void setOctaveFraction(int fraction);
     int getOctaveFraction() const { return octaveFraction; }
+
+    /** Called when the octave fraction is changed.
+
+        The measurement behind the display is configured from this, so the control that changes
+        the resolution has to be the same one the analysis is set up from. While two displays
+        each had their own octave control and only one of them reached the worker, the visible
+        selector changed the picture and not the measurement. */
+    std::function<void()> onOctaveChanged;
 
     void setStyle(Style newStyle);
     Style getStyle() const { return style; }
@@ -157,6 +166,8 @@ private:
     void rebuildDisplay();
     void updatePeakHold();
     juce::Rectangle<float> plotArea() const;
+    juce::Rectangle<float> sidebarArea() const;
+    void drawLevelSidebar(juce::Graphics& g) const;
     float minimumLabelSpacing(const juce::Rectangle<float>& area) const;
     /** One frame of history, drawn as a row along the bottom.
 
@@ -186,6 +197,10 @@ private:
     juce::String getAxisLabel() const;
     void drawLevelReadout(juce::Graphics& g, const juce::Rectangle<float>& area) const;
     juce::Colour traceColourFor(size_t index) const;
+    juce::Colour peakHoldColourFor(size_t traceIndex) const;
+    /** Thick enough to read over a filled bar or a bright live curve, thin enough that
+        the live trace underneath is still visible. */
+    static constexpr float peakHoldThickness = 2.4f;
     juce::String frequencyLabel(float freq) const;
     juce::Font frequencyLabelFont() const;
     float frequencyLabelHeight() const;
@@ -238,6 +253,13 @@ private:
     juce::ComboBox modeSelector;
     juce::ComboBox octaveSelector;
     juce::ComboBox rangeSelector;
+    // Manual range entry. A preset list cannot cover every measurement: a noise floor
+    // sitting at -85 dB is invisible on a 0 / -120 axis and off the top of a 20 / -60
+    // one, so the floor is typed in instead of picked from a list.
+    juce::TextButton manualRangeButton { "Manual" };
+    juce::TextEditor topDbEditor;
+    juce::TextEditor bottomDbEditor;
+    bool rangeEditorsVisible = false;
     juce::ToggleButton peakHoldButton { "Peak Hold" };
     juce::ToggleButton freezeButton { "Freeze" };
     juce::Label readoutLabel;
