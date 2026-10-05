@@ -548,8 +548,9 @@ void FFTDisplay::pushData(const std::vector<float>& freq,
     current.valid = !freq.empty();
 
     // One column per frame of live data, so the time axis is real time and not the
-    // refresh rate of the window.
-    if (style == Style::Spectrogram && isShowing())
+    // refresh rate of the window. Visibility rather than isShowing: the history is worth
+    // keeping while a panel is behind a tab, and it costs one row of the picture per frame.
+    if (style == Style::Spectrogram && isVisible())
         pushSpectrogramFrame(current);
 
     // Only the microphone channel is calibrated. The reference channel is usually a
@@ -1081,10 +1082,50 @@ float FFTDisplay::spectrogramBandLevel(const Frame& frame, int band) const
         ++count;
     }
 
-    // A band with no FFT bin in it still has a frequency of its own; reporting the floor
-    // keeps the history continuous instead of leaving holes that were never measured.
+    // A band with no FFT bin in it still has a frequency of its own. The bands are one
+    // plot pixel wide, so whenever the plot is wider than the transform the bands are
+    // narrower than the bin spacing and most of them would land on no bin at all; taking
+    // the floor there would leave the history mostly empty at high zoom. The value is read
+    // off the log frequency axis the bands are laid out on, interpolating between the two
+    // bins that bracket the band.
     if (count == 0)
+    {
+        auto below = frame.freq.size();
+        auto above = frame.freq.size();
+
+        for (size_t i = 0; i < frame.freq.size(); ++i)
+        {
+            if (frame.freq[i] <= low)
+                below = i;
+            else if (above == frame.freq.size())
+                above = i;
+        }
+
+        if (below < frame.freq.size() && above < frame.freq.size())
+        {
+            // At the geometric centre of the band, which is the same place the averaging
+            // path above would put the level if the bins were denser than the bands.
+            const auto middle = std::sqrt(low * high);
+            const auto span = std::log(frame.freq[above] / frame.freq[below]);
+
+            if (span <= 0.0f)
+                return frame.measDb[below];
+
+            const auto fraction = juce::jlimit(0.0f, 1.0f,
+                                               (float) (std::log(middle / frame.freq[below]) / span));
+
+            return frame.measDb[below] + (frame.measDb[above] - frame.measDb[below]) * fraction;
+        }
+
+        // Only one side has a bin, so the nearest one is all there is to report.
+        if (below < frame.freq.size())
+            return frame.measDb[below];
+
+        if (above < frame.freq.size())
+            return frame.measDb[above];
+
         return dsp::dbFloor;
+    }
 
     return dsp::db10((float) (total / (double) count));
 }

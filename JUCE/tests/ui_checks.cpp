@@ -418,6 +418,9 @@ int main()
     {
         FFTDisplay spectro;
         spectro.setBounds(0, 0, 1000, 700);
+        // A JUCE component starts out not visible and only becomes visible when a parent
+        // takes it, so the history push is skipped until it is.
+        spectro.setVisible(true);
         spectro.setStyle(FFTDisplay::Style::Spectrogram);
 
         require(spectro.getStyle() == FFTDisplay::Style::Spectrogram,
@@ -532,6 +535,47 @@ int main()
         spectro.setStyle(FFTDisplay::Style::Bands);
         require(spectro.getSpectrogramBands() == 0,
                 "Leaving the spectrogram must drop its history");
+    }
+
+    // ---- Spectrogram at a coarser transform than the plot is wide ----
+    // The bands are one plot pixel wide, so on a wide window with a small transform there
+    // are more bands than there are FFT bins and most bands hold no bin at all. They still
+    // have to carry the level between the bins that bracket them, or the history is full of
+    // holes that were never measured.
+    {
+        FFTDisplay coarse;
+        coarse.setBounds(0, 0, 1000, 700);
+        coarse.setVisible(true);
+        coarse.setStyle(FFTDisplay::Style::Spectrogram);
+
+        std::vector<float> freq, ref, meas, magnitude, phase, coherence;
+        std::vector<char> valid;
+
+        // A flat spectrum, so every band must report the same level wherever it sits
+        // between the bins.
+        for (int i = 0; i <= 64; ++i)
+        {
+            freq.push_back(20.0f * std::pow(1000.0f, (float) i / 64.0f));
+            ref.push_back(-20.0f);
+            meas.push_back(-20.0f);
+            magnitude.push_back(-20.0f);
+            phase.push_back(0.0f);
+            coherence.push_back(1.0f);
+            valid.push_back(1);
+        }
+
+        coarse.pushData(freq, ref, meas, magnitude, phase, coherence, valid);
+
+        require(coarse.getSpectrogramBands() > 65,
+                "The plot has to be wider than the transform for this to be worth checking");
+
+        auto worst = 0.0f;
+
+        for (int band = 0; band < coarse.getSpectrogramBands(); ++band)
+            worst = std::max(worst, std::abs(coarse.getSpectrogramHistoryDb(0, band) + 20.0f));
+
+        require(worst < 0.5f,
+                "Every band must report the level between its bins, not a hole where no bin fell");
     }
 
     std::cout << "PASS: Generator tab has " << visible << " visible controls without resizing; screenshots saved\n";
