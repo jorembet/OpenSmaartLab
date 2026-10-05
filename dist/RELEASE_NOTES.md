@@ -1,4 +1,4 @@
-# OpenSmaartLab 1.1.0
+# OpenSmaartLab 1.1.1
 
 Real-time acoustic measurement application: RTA with octave bands, dual-channel transfer
 function with magnitude/phase/coherence, reverberation, SPL meter, signal generator, and
@@ -10,12 +10,21 @@ analysis over a file, and sessions with export.
 | File | Platform | Notes |
 | --- | --- | --- |
 | `OpenSmaartLab-1.1.0-linux-x86_64.tar.gz` | Linux x86-64 | Built on Ubuntu 26.04, needs glibc 2.43+ |
-| `Smaart8Setup.exe` | Windows | WiX bootstrapper chaining an MSI |
-| `Source code (zip)` / `Source code (tar.gz)` | — | Tag `v1.1.0` |
+| `Source code (zip)` / `Source code (tar.gz)` | — | Tag `v1.1.1` |
 
-There is no macOS build. The C++/JUCE source builds on all three; see the README for the
-build steps. The Python implementation in the repository runs on Windows, macOS and Linux
-without compiling.
+There is no macOS build and no Windows installer is published for this release. The
+C++/JUCE source builds on all three; see the README for the build steps. The Python
+implementation in the repository runs on Windows, macOS and Linux without compiling.
+
+## What 1.1.1 is
+
+A repackaging, not a code change. The application is unchanged from 1.1.0 and the Linux
+tarball above is byte-for-byte the 1.1.0 build. The Windows installer that 1.1.0 carried
+has been withdrawn from publication, and this release republishes the Linux build without
+it. The 1.1.0 release and its `v1.1.0` tag have been removed; `v1.1.1` is the current tag.
+Windows users should build from source, following the README.
+
+## Install on Linux
 
 ## Install on Linux
 
@@ -33,10 +42,6 @@ sudo apt install libgtk-3-0 libasound2t64 libfreetype6 libpng16-16 libbrotli1 zl
 ```
 
 The binary needs glibc 2.43 or newer. On older distributions, build from source instead.
-
-## Install on Windows
-
-Run `Smaart8Setup.exe` and follow the prompts.
 
 ## What is new since 1.0.0
 

@@ -1,2 +1,1 @@
 f09d6ca365361496b9eca9af75b528fe1a6457978ddb72ed9b9ae08b76c22e26  OpenSmaartLab-1.1.0-linux-x86_64.tar.gz
-6faee6f1fb356095e029b0f140ef6df4b92f3a887a73f66ad9a6b9bbb2d903b6  Smaart8Setup.exe
