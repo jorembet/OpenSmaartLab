@@ -698,8 +698,9 @@ different.
 
 ## Releases
 
-`dist/` holds the v1.0.0 artefacts and its release notes. `main` has moved on since that
-tag, so a build from `main` is newer than the published package.
+`dist/` holds the v1.1.0 artefacts and its release notes: a Linux x86-64 tarball, built
+from this tag, and the Windows installer. `main` has moved on since that tag, so a build
+from `main` is newer than the published package.
 
 ---
 
